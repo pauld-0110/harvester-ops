@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script src="demo-data.js"></script>
+<script src="demo-api.js"></script>
+<link rel="stylesheet" href="demo.css">
+<meta charset="UTF-8">
+<title data-i18n="header.title">harvester-ops</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+<!-- v1.4.34: apply saved theme/mode BEFORE style.css parses to avoid FOUC.
+     The inline block reads localStorage + sets data-theme/data-mode on
+     <html> so the right :root palette wins on first paint. -->
+<script>
+  (function() {
+    try {
+      var THEMES = ['suse', 'nord', 'solarized', 'catppuccin', 'tokyo'];
+      var MODES  = ['dark', 'light'];
+      var t = localStorage.getItem('harvester_ops_theme');
+      var m = localStorage.getItem('harvester_ops_mode');
+      if (!t || THEMES.indexOf(t) < 0) t = 'suse';
+      if (!m || MODES.indexOf(m)  < 0) m = 'light';
+      document.documentElement.setAttribute('data-theme', t);
+      document.documentElement.setAttribute('data-mode',  m);
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'suse');
+      document.documentElement.setAttribute('data-mode',  'light');
+    }
+  })();
+</script>
+<link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header>
+      <div class="brand">
+        <img id="brand-logo" src="" alt="" style="display:none;">
+        <span class="logo" id="brand-fallback" data-icon="brand" data-icon-size="22"></span>
+        <span class="title" id="brand-title" data-i18n="header.title">harvester-ops</span>
+      </div>
+      <!-- v1.56.0 : un clic sur la version ouvre l'historique des versions -->
+      <button type="button" class="version version-link tip" id="btn-version"
+              data-tip-i18n="versions.openTip" data-i18n-title="versions.openTip"
+              title="What each version brought">v1.86.0</button>
+    </header>
+
+    <div class="cluster-selector">
+      <label class="sidebar-label" data-i18n="header.cluster">Cluster</label>
+      <div class="cluster-row">
+        <select id="cluster-select">
+          
+          <option value="lyon-lab">lyon-lab</option>
+          
+          <option value="paris-prod">paris-prod</option>
+          
+          <option value="nantes-dr">nantes-dr</option>
+          
+          <option value="lille-edge">lille-edge</option>
+          
+          <option value="bm-staging">bm-staging</option>
+          
+        </select>
+        <button class="btn-icon-sm" id="btn-add-cluster" data-i18n-title="clusters.add" title="Add cluster">+</button>
+      </div>
+    </div>
+
+    <nav>
+      <div class="tab-group expanded" id="tab-group-cluster">
+        <a class="tab tab-group-head" data-group="cluster" href="#cluster" data-i18n-title="tab.cluster" title="Cluster">
+          <span class="tab-icon" data-icon="node"></span>
+          <span class="sidebar-label" data-i18n="tab.cluster">Cluster</span>
+          <span class="tab-group-chevron when-expanded" aria-hidden="true" data-icon="chevronDown" data-icon-size="14"></span>
+        </a>
+        <div class="tab-group-children">
+          <a class="tab tab-child active" data-tab="overview" href="#overview" data-i18n-title="tab.overview" title="Overview">
+            <span class="tab-icon" data-icon="metrics"></span>
+            <span class="sidebar-label" data-i18n="tab.overview">Overview</span>
+          </a>
+          <!-- v1.57.0 : les sections de Harvester, un cluster à la fois -->
+          <a class="tab tab-child" data-tab="storage" href="#storage" data-i18n-title="tab.storageTip" title="Volumes, images and storage classes">
+            <span class="tab-icon" data-icon="storage"></span>
+            <span class="sidebar-label" data-i18n="tab.storage">Storage</span>
+          </a>
+          <a class="tab tab-child" data-tab="network" href="#network" data-i18n-title="tab.networkTip" title="VM networks, overlay networks (kube-ovn) and underlay networks">
+            <span class="tab-icon" data-icon="network"></span>
+            <span class="sidebar-label" data-i18n="tab.network">Network</span>
+          </a>
+          <a class="tab tab-child" data-tab="addons" href="#addons" data-i18n-title="tab.addonsTip" title="Harvester add-ons: what is installed, enable or disable">
+            <span class="tab-icon" data-icon="plug"></span>
+            <span class="sidebar-label" data-i18n="tab.addons">Add-ons</span>
+          </a>
+          <a class="tab tab-child" data-tab="security" href="#security" data-i18n-title="tab.securityTip" title="Secrets and SSH keys of the cluster">
+            <span class="tab-icon" data-icon="shield"></span>
+            <span class="sidebar-label" data-i18n="tab.security">Security</span>
+          </a>
+          <a class="tab tab-child" data-tab="monlog" href="#monlog" data-i18n-title="tab.monlogTip" title="Metrics, alerting and log forwarding of the cluster">
+            <span class="tab-icon" data-icon="activity"></span>
+            <span class="sidebar-label" data-i18n="tab.monlog">Monitoring &amp; Logging</span>
+          </a>
+          <a class="tab tab-child" data-tab="advanced" href="#advanced" data-i18n-title="tab.advancedTip" title="Harvester settings, devices, backup target, support bundles and kubeconfigs">
+            <span class="tab-icon" data-icon="settings"></span>
+            <span class="sidebar-label" data-i18n="tab.advanced">Advanced</span>
+          </a>
+          <a class="tab tab-child" data-tab="startup" href="#startup" data-i18n-title="tab.startup" title="Startup">
+            <span class="tab-icon icon-green" data-icon="play"></span>
+            <span class="sidebar-label" data-i18n="tab.startup">Startup</span>
+          </a>
+          <a class="tab tab-child" data-tab="shutdown" href="#shutdown" data-i18n-title="tab.shutdown" title="Shutdown">
+            <span class="tab-icon icon-red" data-icon="stop"></span>
+            <span class="sidebar-label" data-i18n="tab.shutdown">Shutdown</span>
+          </a>
+        </div>
+      </div>
+      <!-- v1.85.0 : Virtual machines devient un groupe : les VMs du cluster
+           choisi (l'onglet d'avant, inchangé) et celles de tous les clusters -->
+      <div class="tab-group expanded" id="tab-group-vms">
+        <a class="tab tab-group-head" data-group="vms" href="#vms" data-i18n-title="tab.vmsGroupTip" title="The VMs of the chosen cluster, or of every cluster">
+          <span class="tab-icon" data-icon="vm"></span>
+          <span class="sidebar-label" data-i18n="tab.vms">Virtual machines</span>
+          <span class="tab-group-chevron when-expanded" aria-hidden="true" data-icon="chevronDown" data-icon-size="14"></span>
+        </a>
+        <div class="tab-group-children">
+          <a class="tab tab-child" data-tab="namespaces" href="#namespaces" data-i18n-title="tab.vmsCurrentTip" title="The VMs of the cluster chosen at the top, by namespace">
+            <span class="tab-icon" data-icon="vm"></span>
+            <span class="sidebar-label" data-i18n="tab.vmsCurrent">Current cluster's VMs</span>
+          </a>
+          <a class="tab tab-child" data-tab="allvms" href="#allvms" data-i18n-title="tab.allvmsTip" title="Every VM of every declared cluster in one list: filter, sort and act on them">
+            <span class="tab-icon" data-icon="compute"></span>
+            <span class="sidebar-label" data-i18n="tab.allvms">All clusters VMs</span>
+          </a>
+        </div>
+      </div>
+      <!-- v1.77.0 : tout ce qui fait entrer ou déplacer des VMs, regroupé.
+           VM Import et VMware migrations portent sur le cluster choisi ;
+           Migrations (all clusters) les voit tous. -->
+      <div class="tab-group" id="tab-group-vmio">
+        <a class="tab tab-group-head" data-group="vmio" href="#vmio" data-i18n-title="tab.vmioTip" title="Bring VMs in and move them: imports, VMware migrations, every migration across the clusters">
+          <span class="tab-icon" data-icon="switch"></span>
+          <span class="sidebar-label" data-i18n="tab.vmio">VM Import / Export</span>
+          <span class="tab-group-chevron when-expanded" aria-hidden="true" data-icon="chevronDown" data-icon-size="14"></span>
+        </a>
+        <div class="tab-group-children">
+          <a class="tab tab-child" data-tab="vmimport" href="#vmimport" data-i18n-title="tab.vmimportTip" title="Import VMs from VMware, OpenStack or an OVA archive">
+            <span class="tab-icon" data-icon="download"></span>
+            <span class="sidebar-label" data-i18n="tab.vmimport">VM Import</span>
+          </a>
+          <a class="tab tab-child" data-tab="forklift" href="#forklift" data-i18n-title="tab.forkliftTip" title="Warm migrations of VMware VMs with Forklift: preparation, vCenter sources, inventory">
+            <span class="tab-icon" data-icon="migrate"></span>
+            <span class="sidebar-label" data-i18n="tab.forklift">VMware migrations</span>
+          </a>
+          <a class="tab tab-child" data-tab="forkliftglobal" href="#forkliftglobal" data-i18n-title="tab.forkliftglobalTip" title="Every VMware migration wave running on every declared cluster">
+            <span class="tab-icon" data-icon="cloud"></span>
+            <span class="sidebar-label" data-i18n="tab.forkliftglobal">Migrations (all clusters)</span>
+          </a>
+        </div>
+      </div>
+      <div class="tab-group" id="tab-group-automation">
+        <a class="tab tab-group-head" data-group="automation" href="#automation" data-i18n-title="tab.automation" title="Automation">
+          <span class="tab-icon" data-icon="robot"></span>
+          <span class="sidebar-label" data-i18n="tab.automation">Automation</span>
+          <span class="tab-group-chevron when-expanded" aria-hidden="true" data-icon="chevronDown" data-icon-size="14"></span>
+        </a>
+        <div class="tab-group-children">
+          <a class="tab tab-child" data-subtab="capi"
+             href="#automation/capi" data-i18n-title="automation.tab.capi.tip" title="Cluster API (RKE2) — declarative cluster provisioning via CAPHV">
+            <span class="tab-icon" data-icon="capi"></span>
+            <span class="sidebar-label" data-i18n="automation.tab.capi">Cluster API</span>
+          </a>
+          <a class="tab tab-child" data-subtab="terraform"
+             href="#automation/terraform" data-i18n-title="automation.tab.terraform" title="Terraform infrastructure">
+            <span class="tab-icon" data-icon="terraform"></span>
+            <span class="sidebar-label" data-i18n="automation.tab.terraform">Terraform</span>
+          </a>
+          <a class="tab tab-child" data-subtab="pxe"
+             href="#automation/pxe" data-i18n-title="automation.tab.pxe.tip" title="Bare-metal (BMC / Redfish)">
+            <span class="tab-icon" data-icon="baremetal"></span>
+            <span class="sidebar-label" data-i18n="automation.tab.pxe">Bare-metal</span>
+          </a>
+        </div>
+      </div>
+      <a class="tab"        data-tab="activity"     href="#activity" data-i18n-title="tab.activity" title="Activity"><span class="tab-icon" data-icon="activity"></span> <span class="sidebar-label" data-i18n="tab.activity">Activity</span></a>
+    </nav>
+
+    <footer>
+      <span class="session-role tip" id="session-role" hidden
+            data-tip-i18n="role.badgeTip" data-i18n-title="role.badgeTip"
+            title="Your role on this console"></span>
+      <button class="sidebar-collapse-btn tip" id="btn-sidebar-pin"
+              data-tip-i18n="sidebar.pinTip" data-i18n-title="sidebar.pinTip"
+              title="Keep the menu open instead of letting it expand on hover">
+        <span class="tab-icon" data-icon="pin"></span>
+        <span class="sidebar-label when-unpinned" data-i18n="sidebar.pin">Pin menu open</span>
+        <span class="sidebar-label when-pinned" data-i18n="sidebar.unpin">Unpin menu</span>
+      </button>
+    </footer>
+  </aside>
+
+  <main id="content">
+    <!-- Top bar with docs + settings buttons -->
+    <div class="topbar">
+      <button class="btn-icon" id="btn-docs" data-i18n-title="header.docs" title="Documentation" aria-label="Documentation">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+        </svg>
+      </button>
+      <button class="btn-icon" id="btn-settings" data-i18n-title="header.settings" title="Settings" aria-label="Settings">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+      <!-- v1.56.0 : le compte de la personne (rôle, identité sur les clusters,
+           session) et la déconnexion, quel que soit le mode de connexion -->
+      <span class="user-menu-wrap">
+        <button class="btn-icon tip" id="btn-user" type="button" aria-haspopup="menu" aria-expanded="false"
+                aria-controls="user-menu" data-tip-i18n="user.menuTip" data-i18n-title="user.menuTip"
+                title="Your account: role, identity on the clusters, sign out" aria-label="Account">
+          <span class="user-initials" id="user-initials" hidden></span>
+          <span class="user-icon" data-icon="user" data-icon-size="18"></span>
+        </button>
+        <div class="user-menu card" id="user-menu" role="menu" hidden></div>
+      </span>
+    </div>
+
+    <!-- v1.56.0 : ce que le cluster (ou Rancher) a refusé de montrer -->
+    <div class="access-notice" id="access-notice" role="status" hidden></div>
+
+    <!-- OVERVIEW -->
+    <section id="tab-overview" class="tab-content active">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="overview.title">Overview</span> — <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist" aria-label="Overview sub-tabs">
+          <button type="button" class="sub-tab active" data-overview-tab="metrics"><span class="tab-icon" data-icon="metrics"></span> <span data-i18n="overview.tabMetrics">Metrics</span></button>
+          <button type="button" class="sub-tab" data-overview-tab="cluster"><span class="tab-icon" data-icon="node"></span> <span data-i18n="overview.tabCluster">Cluster</span></button>
+          <button type="button" class="sub-tab tip" data-overview-tab="events" data-tip-i18n="ev.tip.tab" data-i18n-title="ev.tip.tab" title="The cluster events, by hosts, VMs, volumes and images, as on Harvester's dashboard"><span class="tab-icon" data-icon="activity"></span> <span data-i18n="ev.tab">Events</span></button>
+        </div>
+        <!-- v1.69.0 : le bouton Upgrade du tableau de bord de Harvester -->
+        <div class="section-actions">
+          <button type="button" id="btn-upgrade" class="btn btn-sm btn-secondary tip"
+                  data-tip-i18n="upg.t.open" data-i18n-title="upg.t.open" title="Upgrade Harvester: versions, progress, logs">
+            <span data-icon="upload"></span> <span data-i18n="upg.open">Upgrade</span></button>
+        </div>
+      </div>
+
+      <!-- Metrics subtab — the classic landing view -->
+      <div class="overview-subtab" data-subtab="metrics">
+        <div class="metrics">
+          <div class="metric"><div class="label" data-i18n="overview.nodes">Nodes</div><div class="value" id="m-nodes">–</div></div>
+          <div class="metric"><div class="label" data-i18n="overview.vmsRunning">VMs running</div><div class="value" id="m-vms">–</div></div>
+          <div class="metric"><div class="label" data-i18n="overview.longhornVolumes">Longhorn volumes</div><div class="value" id="m-volumes">–</div></div>
+          <div class="metric"><div class="label" data-i18n="overview.rebuildLimit">Rebuild limit</div><div class="value" id="m-rebuild">–</div></div>
+        </div>
+        <!-- v1.62.0 : les jauges du tableau de bord de Harvester -->
+        <div class="card" id="overview-usage" hidden>
+          <div class="card-header"><h2 data-i18n="ev.usage">Usage</h2></div>
+          <div class="usage-gauges" data-usage="body"></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h2 data-i18n="overview.nodesTable">Nodes</h2><button class="btn btn-sm" onclick="App.refreshStatus()" data-i18n="overview.refresh">Refresh</button></div>
+          <table class="data-table" id="nodes-table">
+            <thead><tr>
+              <th data-i18n="col.name">Name</th>
+              <th data-i18n="col.ready">Ready</th>
+              <th data-i18n="col.schedulable">Schedulable</th>
+              <th data-i18n="col.roles">Roles</th>
+              <th data-i18n="col.notes">Notes</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Vue de blocs du cluster (v1.43.0). Depuis la v1.57.0, Réseau,
+           Fabrique, Stockage et VPC vivent dans leurs sections. -->
+      <div class="overview-subtab" data-subtab="cluster" data-board="cluster" hidden>
+        <div class="topology-host" data-topology-mode="cluster"></div>
+      </div>
+      <!-- v1.62.0 : les événements du tableau de bord de Harvester -->
+      <div class="overview-subtab" data-subtab="events" data-board="events" hidden>
+        <div class="topology-host"></div>
+      </div>
+    </section>
+
+    <!-- v1.57.0 : STORAGE (Volumes, Images, Storage Classes) -->
+    <section id="tab-storage" class="tab-content" data-section="storage">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.storage">Storage</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="volumes" data-i18n-title="section.volumesTip" title="Longhorn volumes, their replicas and the VMs using them"><span class="tab-icon" data-icon="volume"></span> <span data-i18n="section.volumes">Volumes</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="images" data-i18n-title="section.imagesTip" title="VM images: source, size, state and the VMs using them"><span class="tab-icon" data-icon="cdrom"></span> <span data-i18n="section.images">Images</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="classes" data-i18n-title="section.classesTip" title="Storage classes: replicas, placement and the volumes using them"><span class="tab-icon" data-icon="disk"></span> <span data-i18n="section.classes">Storage Classes</span></button>
+        </div>
+        <div class="section-actions">
+          <button type="button" class="btn btn-sm btn-primary tip" data-section-new="volume" data-pane-only="volumes"
+                  data-tip-i18n="of.t.newVolume" data-i18n-title="of.t.newVolume" title="Create an empty volume, or one from an image">
+            <span data-icon="add"></span> <span data-i18n="of.new.volume">New volume</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="volumes" data-board="storage" hidden><div class="topology-host" data-topology-mode="storage"></div></div>
+      <div class="section-pane" data-pane="images" hidden><div class="resource-host" data-resource="images"></div></div>
+      <div class="section-pane" data-pane="classes" hidden><div class="resource-host" data-resource="storageclasses"></div></div>
+    </section>
+
+    <!-- v1.57.0 : NETWORK (réseaux des VMs, overlay kube-ovn, underlay) -->
+    <section id="tab-network" class="tab-content" data-section="network">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.network">Network</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="vmnets" data-i18n-title="section.vmnetsTip" title="The networks VMs attach to (VLAN, untagged), one block per network"><span class="tab-icon" data-icon="network"></span> <span data-i18n="section.vmnets">VM Networks</span></button>
+          <!-- v1.65.0 : le menu Networks de Harvester -->
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="clusternets" data-i18n-title="section.clusternetsTip" title="Cluster networks, their configurations (NICs, bond, MTU) and the storage, migration and RWX networks"><span class="tab-icon" data-icon="switch"></span> <span data-i18n="section.clusternets">Cluster Networks</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="lbs" data-i18n-title="section.lbsTip" title="Load balancers in front of VMs, with an address from DHCP or an IP pool"><span class="tab-icon" data-icon="network"></span> <span data-i18n="section.lbs">Load Balancers</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="pools" data-i18n-title="section.poolsTip" title="The address ranges the load balancers draw from"><span class="tab-icon" data-icon="network"></span> <span data-i18n="section.pools">IP Pools</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="hostnets" data-i18n-title="section.hostnetsTip" title="An address on each host on a VLAN of a cluster network"><span class="tab-icon" data-icon="network"></span> <span data-i18n="section.hostnets">Host Networks</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="overlay" data-i18n-title="overview.tabVpcTip" title="kube-ovn: VPCs, subnets and overlay networks, with their forms"><span class="tab-icon" data-icon="network"></span> <span data-i18n="section.overlay">Overlay Networks</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="underlay" data-i18n-title="overview.tabFabricTip" title="Physical interfaces, virtual switches and the networks above them"><span class="tab-icon" data-icon="switch"></span> <span data-i18n="section.underlay">Underlay Networks</span></button>
+        </div>
+        <div class="section-actions">
+          <button type="button" class="btn btn-sm btn-primary tip needs-admin" data-section-new="network" data-pane-only="vmnets"
+                  data-tip-i18n="of.t.newNetwork" data-i18n-title="of.t.newNetwork" title="Create a VM network: a VLAN or an untagged network on a cluster network">
+            <span data-icon="add"></span> <span data-i18n="of.new.network">New VM network</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="vmnets" data-board="network" hidden><div class="topology-host" data-topology-mode="network"></div></div>
+      <div class="section-pane" data-pane="clusternets" hidden><div class="na-host"></div></div>
+      <div class="section-pane" data-pane="lbs" hidden><div class="resource-host" data-resource="loadbalancers"></div></div>
+      <div class="section-pane" data-pane="pools" hidden><div class="resource-host" data-resource="ippools"></div></div>
+      <div class="section-pane" data-pane="hostnets" hidden><div class="resource-host" data-resource="hostnetworks"></div></div>
+      <!-- v1.49.0 : réseaux kube-ovn, un bloc par VPC, avec leurs formulaires -->
+      <div class="section-pane" data-pane="overlay" data-board="vpc" hidden><div class="topology-host" data-topology-mode="vpc"></div></div>
+      <div class="section-pane" data-pane="underlay" data-board="fabric" hidden><div class="topology-host" data-topology-mode="fabric"></div></div>
+    </section>
+
+    <!-- v1.57.0 : ADD-ONS -->
+    <section id="tab-addons" class="tab-content" data-section="addons">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.addons">Add-ons</span> · <span class="cluster-name"></span></h1>
+          <p class="hint" data-i18n="section.addonsHint">Optional components Harvester installs on demand. Enabling one deploys its chart on the cluster; disabling it removes it.</p>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="list" hidden><div class="resource-host" data-resource="addons"></div></div>
+    </section>
+
+    <!-- v1.57.0 : SECURITY (Secrets, SSH Keys) -->
+    <section id="tab-security" class="tab-content" data-section="security">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.security">Security</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="secrets" data-i18n-title="section.secretsTip" title="Secrets of the cluster: type, key names and the VMs using them. Values are never shown."><span class="tab-icon" data-icon="lock"></span> <span data-i18n="section.secrets">Secrets</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="sshkeys" data-i18n-title="section.sshkeysTip" title="SSH public keys declared on the cluster and the VMs that received them"><span class="tab-icon" data-icon="key"></span> <span data-i18n="section.sshkeys">SSH Keys</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="secrets" hidden><div class="resource-host" data-resource="secrets"></div></div>
+      <div class="section-pane" data-pane="sshkeys" hidden><div class="resource-host" data-resource="sshkeys"></div></div>
+    </section>
+
+    <!-- v1.71.0 : VM IMPORT (vm-import-controller) -->
+    <section id="tab-vmimport" class="tab-content" data-section="vmimport">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.vmimport">VM Import</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="imports" data-i18n-title="section.importsTip" title="Imports of VMs, step by step, with the progress of their disks"><span class="tab-icon" data-icon="migrate"></span> <span data-i18n="section.imports">Imports</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="vmware" data-i18n-title="section.vmwareTip" title="vCenter servers VMs are imported from"><span class="tab-icon" data-icon="cloud"></span> <span>VMware</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="openstack" data-i18n-title="section.openstackTip" title="OpenStack projects VMs are imported from"><span class="tab-icon" data-icon="cloud"></span> <span>OpenStack</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="ova" data-i18n-title="section.ovaTip" title="OVA archives served over HTTP or HTTPS"><span class="tab-icon" data-icon="bundle"></span> <span>OVA</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="imports" hidden><div class="na-host" data-vi="imports"></div></div>
+      <div class="section-pane" data-pane="vmware" hidden><div class="na-host" data-vi="vmware"></div></div>
+      <div class="section-pane" data-pane="openstack" hidden><div class="na-host" data-vi="openstack"></div></div>
+      <div class="section-pane" data-pane="ova" hidden><div class="na-host" data-vi="ova"></div></div>
+    </section>
+
+    <!-- v1.75.0 : MIGRATIONS VMWARE (Forklift) -->
+    <section id="tab-forklift" class="tab-content" data-section="forklift">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.forklift">VMware migrations</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="prep" data-i18n-title="section.fkPrepTip" title="What Forklift needs on this cluster, step by step"><span class="tab-icon" data-icon="settings"></span> <span data-i18n="section.fkPrep">Preparation</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="sources" data-i18n-title="section.fkSourcesTip" title="The vCenter servers Forklift reads VMs from"><span class="tab-icon" data-icon="cloud"></span> <span data-i18n="section.fkSources">vCenter sources</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="inventory" data-i18n-title="section.fkInventoryTip" title="VMs, networks and datastores of a vCenter as Forklift sees them"><span class="tab-icon" data-icon="general"></span> <span data-i18n="section.fkInventory">Inventory</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="waves" data-i18n-title="section.fkWavesTip" title="Warm migration waves: compose, follow, switch over, roll back, close"><span class="tab-icon" data-icon="migrate"></span> <span data-i18n="section.fkWaves">Waves</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="prep" hidden><div class="na-host" data-fk="prep"></div></div>
+      <div class="section-pane" data-pane="sources" hidden><div class="na-host" data-fk="sources"></div></div>
+      <div class="section-pane" data-pane="inventory" hidden><div class="na-host" data-fk="inventory"></div></div>
+      <div class="section-pane" data-pane="waves" hidden><div class="na-host" data-fk="waves"></div></div>
+    </section>
+
+    <!-- v1.70.0 : MONITORING & LOGGING -->
+    <section id="tab-monlog" class="tab-content" data-section="monlog">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.monlog">Monitoring &amp; Logging</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="metrics" data-i18n-title="section.metricsTip" title="Hosts and VMs: current use, and history when rancher-monitoring runs"><span class="tab-icon" data-icon="metrics"></span> <span data-i18n="section.metrics">Metrics</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="alerts" data-i18n-title="section.alertsTip" title="Alertmanager configurations: where alerts go"><span class="tab-icon" data-icon="warn"></span> <span data-i18n="section.alerts">Alertmanager</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="flows" data-i18n-title="section.flowsTip" title="Which logs, audit records or events are sent, and where"><span class="tab-icon" data-icon="activity"></span> <span data-i18n="section.flows">Flows</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="outputs" data-i18n-title="section.outputsTip" title="Where logs are sent: Elasticsearch, Loki, Splunk, syslog, S3..."><span class="tab-icon" data-icon="upload"></span> <span data-i18n="section.outputs">Outputs</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="metrics" hidden><div class="na-host" data-ml="metrics"></div></div>
+      <div class="section-pane" data-pane="alerts" hidden><div class="na-host" data-ml="alerts"></div></div>
+      <div class="section-pane" data-pane="flows" hidden><div class="na-host" data-ml="flows"></div></div>
+      <div class="section-pane" data-pane="outputs" hidden><div class="na-host" data-ml="outputs"></div></div>
+    </section>
+
+    <!-- v1.67.0 : ADVANCED (Settings, Support) -->
+    <section id="tab-advanced" class="tab-content" data-section="advanced">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="tab.advanced">Advanced</span> · <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist">
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="settings" data-i18n-title="section.settingsTip" title="Every Harvester setting: its value, whether Harvester applied it, and a typed form to change or reset it"><span class="tab-icon" data-icon="settings"></span> <span data-i18n="section.settings">Settings</span></button>
+          <!-- v1.68.0 : les périphériques de Harvester -->
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="pci" data-i18n-title="section.pciTip" title="PCI devices of every host: enable or disable their passthrough to VMs"><span class="tab-icon" data-icon="plug"></span> <span data-i18n="section.pci">PCI Devices</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="usb" data-i18n-title="section.usbTip" title="USB devices of every host: enable or disable their passthrough to VMs"><span class="tab-icon" data-icon="hotplug"></span> <span data-i18n="section.usb">USB Devices</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="sriov" data-i18n-title="section.sriovTip" title="SR-IOV network cards: the number of virtual functions they expose"><span class="tab-icon" data-icon="switch"></span> <span data-i18n="section.sriov">SR-IOV Networks</span></button>
+          <button type="button" class="sub-tab tip" role="tab" data-section-tab="support" data-i18n-title="section.supportTip" title="Harvester support bundles and kubeconfigs limited to a role, with a token that expires"><span class="tab-icon" data-icon="bundle"></span> <span data-i18n="section.support">Support</span></button>
+        </div>
+      </div>
+      <div class="section-pane" data-pane="settings" hidden><div class="na-host" data-adv="settings"></div></div>
+      <div class="section-pane" data-pane="pci" hidden><div class="na-host" data-adv="pci"></div></div>
+      <div class="section-pane" data-pane="usb" hidden><div class="na-host" data-adv="usb"></div></div>
+      <div class="section-pane" data-pane="sriov" hidden><div class="na-host" data-adv="sriov"></div></div>
+      <div class="section-pane" data-pane="support" hidden><div class="na-host" data-adv="support"></div></div>
+    </section>
+
+    <!-- SHUTDOWN -->
+    <section id="tab-shutdown" class="tab-content">
+      <div class="shutdown-header">
+        <div class="automation-header-text">
+          <h1><span data-i18n="shutdown.title">Shutdown</span> — <span class="cluster-name"></span></h1>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist" aria-label="Shutdown sub-tabs">
+          <button type="button" class="sub-tab active" data-shutdown-tab="cluster" data-i18n="shutdown.subtabCluster">Arrêt du cluster</button>
+          <button type="button" class="sub-tab" data-shutdown-tab="order" data-i18n="shutdown.subtabOrder">Ordre d'arrêt des VMs</button>
+        </div>
+      </div>
+      <p class="hint" data-i18n="shutdown.hint">Graceful shutdown of the selected cluster.</p>
+
+      <div class="shutdown-subtab" data-subtab="cluster">
+        <div class="shutdown-options card">
+          <div class="card-header"><h2 data-i18n="shutdown.options">Options</h2></div>
+          <div style="padding:14px 16px;">
+            <label class="opt-row">
+              <input type="checkbox" id="opt-snapshot">
+              <span><span data-icon="snapshot" class="icon-dim"></span> <strong data-i18n="shutdown.optSnapshot">Snapshot running VMs before shutdown</strong>
+                <span class="opt-hint" data-i18n="shutdown.optSnapshotHint">Creates a VirtualMachineBackup (type=snapshot) for each running VM.</span>
+              </span>
+            </label>
+            <label class="opt-row">
+              <input type="checkbox" id="opt-force">
+              <span><span data-icon="warn" class="icon-warn"></span> <strong data-i18n="shutdown.optForce">Force (ignore failed safety checks)</strong>
+                <span class="opt-hint" data-i18n="shutdown.optForceHint">Continue even if the etcd snapshot fails or VM volumes stay attached. Without it, the sequence aborts on a failed safety check.</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div class="steps-panel">
+          <ol class="steps" id="shutdown-steps">
+            <li data-step="preflight"        class="step"><span class="bullet"></span><span class="label" data-i18n="step.preflight">Pre-flight checks</span><span class="msg"></span></li>
+            <li data-step="etcd-snapshot"    class="step"><span class="bullet"></span><span class="label" data-i18n="step.etcdSnapshot">etcd snapshot</span><span class="msg"></span></li>
+            <li data-step="vm-snapshot"      class="step"><span class="bullet"></span><span class="label" data-i18n="step.vmSnapshot">Snapshot VMs (optional)</span><span class="msg"></span></li>
+            <li data-step="vm-stop"          class="step"><span class="bullet"></span><span class="label" data-i18n="step.vmStop">Stop VMs (ordered)</span><span class="msg"></span></li>
+            <li data-step="longhorn-maint"   class="step"><span class="bullet"></span><span class="label" data-i18n="step.longhornMaint">Longhorn maintenance</span><span class="msg"></span></li>
+            <li data-step="cordon"           class="step"><span class="bullet"></span><span class="label" data-i18n="step.cordon">Cordon nodes</span><span class="msg"></span></li>
+            <li data-step="shutdown-workers" class="step"><span class="bullet"></span><span class="label" data-i18n="step.shutdownWorkers">Shutdown workers</span><span class="msg"></span></li>
+            <li data-step="shutdown-cp"      class="step"><span class="bullet"></span><span class="label" data-i18n="step.shutdownCp">Shutdown control-plane</span><span class="msg"></span></li>
+          </ol>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-danger" id="btn-shutdown"><span class="icon-red" data-icon="stop"></span> <span data-i18n="shutdown.btn">Start shutdown</span></button>
+          <label class="dry-run-inline">
+            <input type="checkbox" class="dry-run-sync" data-sync-dryrun>
+            <span data-i18n="sidebar.dryRunMode">Dry-run mode</span>
+          </label>
+          <button class="btn btn-secondary" id="btn-cancel-shutdown" disabled data-i18n="shutdown.cancel">Cancel</button>
+        </div>
+
+        <div class="log-viewer">
+          <h3 data-i18n="log.live">Live log</h3>
+          <pre id="shutdown-log" class="live-log"></pre>
+        </div>
+      </div><!-- /.shutdown-subtab[cluster] -->
+
+      <div class="shutdown-subtab" data-subtab="order" hidden>
+        <div class="card">
+          <div class="card-header">
+            <h2 data-i18n="shutdown.vmOrder">VM shutdown order</h2>
+            <div>
+              <button class="btn btn-sm btn-secondary" id="btn-vms-refresh" data-i18n="shutdown.reload">Reload</button>
+              <button class="btn btn-sm btn-primary" id="btn-vms-save"><span data-icon="save"></span> <span data-i18n="shutdown.saveOrder">Save order</span></button>
+            </div>
+          </div>
+          <div style="padding:12px 16px;">
+            <p class="hint groups-intro" style="margin:0 0 10px;" data-i18n="shutdown.groupsIntro">
+              VMs in the same group stop in parallel. Groups are processed sequentially in the order shown.
+              The "Default" group is the catch-all for VMs without explicit assignment — its VMs all stop together.
+            </p>
+            <div class="vm-order-toolbar">
+              <label class="form-inline">
+                <span data-i18n="shutdown.filterByNs">Filter:</span>
+                <select id="vm-order-filter-ns">
+                  <option value="">— <span data-i18n="shutdown.allNamespaces">all namespaces</span> —</option>
+                </select>
+              </label>
+              <label class="form-inline">
+                <span data-i18n="shutdown.sortBy">Sort:</span>
+                <select id="vm-order-sort">
+                  <option value="priority" data-i18n="shutdown.sortPriority">Priority (then name)</option>
+                  <option value="namespace" data-i18n="shutdown.sortNs">Namespace then name</option>
+                  <option value="name" data-i18n="shutdown.sortName">Name</option>
+                  <option value="phase" data-i18n="shutdown.sortPhase">Phase</option>
+                </select>
+              </label>
+              <div class="priority-help tip" data-tip-i18n="shutdown.priorityTip" style="margin-left:auto; color:var(--text-dim); font-size:11px; cursor:help;">
+                <span data-icon="help" data-icon-size="14"></span> <span data-i18n="shutdown.priorityHelp">How priorities work</span>
+              </div>
+            </div>
+            <div class="vm-order-list" id="vm-order-list"></div>
+          </div>
+        </div>
+      </div><!-- /.shutdown-subtab[order] -->
+    </section>
+
+    <!-- STARTUP -->
+    <section id="tab-startup" class="tab-content">
+      <h1><span data-i18n="startup.title">Startup</span> — <span class="cluster-name"></span></h1>
+      <p class="hint" data-i18n="startup.hint">Bring the cluster back online.</p>
+
+      <p class="hint groups-intro" data-i18n="startup.groupsIntro">
+        VMs start in the reverse order of shutdown: the last group stopped is the first to come back up.
+        Within each group, all VMs start in parallel and are waited on together before the next group fires.
+        Edit groups from the Shutdown tab — the same configuration drives both.
+      </p>
+
+      <div class="steps-panel">
+        <ol class="steps" id="startup-steps">
+          <li data-step="power-cp1"        class="step"><span class="bullet"></span><span class="label" data-i18n="step.powerCp1">Power on first CP</span><span class="msg"></span></li>
+          <li data-step="power-rest"       class="step"><span class="bullet"></span><span class="label" data-i18n="step.powerRest">Power on remaining nodes</span><span class="msg"></span></li>
+          <li data-step="wait-ready"       class="step"><span class="bullet"></span><span class="label" data-i18n="step.waitReady">Wait for Nodes Ready</span><span class="msg"></span></li>
+          <li data-step="restore"          class="step"><span class="bullet"></span><span class="label" data-i18n="step.restore">Restore cluster state</span><span class="msg"></span></li>
+          <li data-step="vm-restart"       class="step"><span class="bullet"></span><span class="label" data-i18n="step.vmRestart">Restart VMs (reverse-group order, parallel within group)</span><span class="msg"></span></li>
+        </ol>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-startup"><span class="icon-green" data-icon="play"></span> <span data-i18n="startup.btn">Start startup</span></button>
+        <label class="dry-run-inline">
+          <input type="checkbox" class="dry-run-sync" data-sync-dryrun>
+          <span data-i18n="sidebar.dryRunMode">Dry-run mode</span>
+        </label>
+      </div>
+
+      <div class="log-viewer">
+        <h3 data-i18n="log.live">Live log</h3>
+        <pre id="startup-log" class="live-log"></pre>
+      </div>
+    </section>
+
+    <!-- VIRTUAL MACHINES (data-tab kept as 'namespaces' for backward compat) -->
+    <section id="tab-namespaces" class="tab-content">
+      <h1><span data-i18n="vms.title">Virtual machines</span> — <span class="cluster-name"></span></h1>
+      <p class="hint" data-i18n="vms.hint">Manage VMs of a namespace. Pick the namespace below.</p>
+
+      <div class="ns-selector-row">
+        <label data-i18n="vms.namespace">Namespace:</label>
+        <select id="ns-dropdown"></select>
+        <span class="vm-count-badge" id="ns-vm-count">0 VMs</span>
+        <!-- v1.58.0 : le menu « Backup and Snapshots » de Harvester, en fenêtre -->
+        <button class="btn btn-sm btn-secondary btn-ico tip" id="btn-vm-backups"
+                data-tip-i18n="vms.backupsTip" data-i18n-title="vms.backupsTip"
+                title="Backups, snapshots and their schedules for this namespace, in a window"><span data-icon="snapshot"></span> <span data-i18n="vms.backups">Backups</span></button>
+        <!-- v1.64.0 : les modèles de VM et les modèles cloud-init de Harvester -->
+        <button class="btn btn-sm btn-secondary btn-ico tip" id="btn-vm-templates"
+                data-tip-i18n="tpl.tip.open" data-i18n-title="tpl.tip.open"
+                title="The VM templates of this cluster and their versions, in a window"><span data-icon="doc"></span> <span data-i18n="tpl.open">Templates</span></button>
+        <button class="btn btn-sm btn-secondary btn-ico tip" id="btn-vm-cloudtpl"
+                data-tip-i18n="ct.tip.open" data-i18n-title="ct.tip.open"
+                title="Reusable cloud-init user-data and network-data, in a window"><span data-icon="cloud"></span> <span data-i18n="ct.open">Cloud configs</span></button>
+        <!-- v1.62.0 : le menu Namespaces de Harvester, en fenêtre -->
+        <button class="btn btn-sm btn-secondary btn-ico tip" id="btn-vm-namespaces"
+                data-tip-i18n="nsw.tip.open" data-i18n-title="nsw.tip.open"
+                title="Create, change and delete the namespaces of this cluster, in a window"><span data-icon="placement"></span> <span data-i18n="nsw.open">Namespaces</span></button>
+        <button class="btn btn-sm btn-secondary" id="btn-ns-notes" data-i18n-title="vms.nsNotes" title="Namespace notes"><span data-icon="notes"></span> <span data-i18n="vms.nsNotes">Namespace notes</span></button>
+        <button class="btn btn-sm btn-primary btn-ico tip" id="btn-vm-create"
+                data-tip-i18n="vm.create.tip.open" data-i18n-title="vm.create.tip.open"
+                title="Create a virtual machine on this cluster"><span data-icon="add"></span> <span data-i18n="vm.create.button">Create</span></button>
+        <button class="btn btn-sm btn-secondary btn-ico tip" id="btn-vm-exports"
+                data-tip-i18n="transfer.exportsTip" data-i18n-title="transfer.exportsTip"
+                title="The export store: VM archives to download, import into a cluster, or add from this computer."><span data-icon="bundle"></span> <span data-i18n="transfer.exports">Exports</span></button>
+        <button class="btn btn-sm btn-secondary" id="btn-ns-refresh" data-i18n="overview.refresh">Refresh</button>
+      </div>
+
+      <div class="bulk-toolbar" id="bulk-toolbar" style="display:none;">
+        <span class="bulk-count"><strong id="bulk-count-num">0</strong> <span data-i18n="namespaces.selected">selected</span></span>
+        <button class="btn btn-sm btn-danger"  id="btn-bulk-stop"><span class="icon-red" data-icon="stop"></span> <span data-i18n="namespaces.bulkStop">Stop</span></button>
+        <button class="btn btn-sm btn-primary" id="btn-bulk-start"><span class="icon-green" data-icon="play"></span> <span data-i18n="namespaces.bulkStart">Start</span></button>
+        <button class="btn btn-sm btn-secondary tip" data-bulk-do="restart" data-tip-i18n="vma.bulk.restartTip" data-tip="Restart the selected VMs"><span data-icon="restart"></span> <span data-i18n="vma.restart">Restart</span></button>
+        <button class="btn btn-sm btn-secondary tip" data-bulk-do="force-stop" data-tip-i18n="vma.bulk.forceStopTip" data-tip="Stop the selected VMs at once"><span data-icon="power"></span> <span data-i18n="vma.forceStop">Force stop</span></button>
+        <button class="btn btn-sm btn-secondary tip" data-bulk-do="migrate" data-tip-i18n="vma.bulk.migrateTip" data-tip="Live-migrate the selected VMs to another node"><span data-icon="migrate"></span> <span data-i18n="vma.migrate">Migrate</span></button>
+        <div class="bulk-strategy">
+          <span data-i18n="namespaces.bulkSetStrategy">Set strategy:</span>
+          <select id="bulk-strategy-select">
+            <option value="Always">Always</option>
+            <option value="RerunOnFailure">RerunOnFailure</option>
+            <option value="Manual">Manual</option>
+            <option value="Halted">Halted</option>
+          </select>
+          <button class="btn btn-sm btn-secondary" id="btn-bulk-strategy" data-i18n="common.apply">Apply</button>
+        </div>
+        <button class="btn btn-sm" id="btn-bulk-clear" data-i18n="namespaces.clearSelection">Clear</button>
+      </div>
+
+      <div class="ns-vm-filter-row">
+        <input type="search" id="ns-vm-filter" class="tip" autocomplete="off"
+               data-i18n-placeholder="vms.filterPh" placeholder="Filter: name, IP, node, or a label key=value"
+               data-tip-i18n="vms.filterTip" data-tip="Keep the VMs matching every word: part of the name, an IP, a node, a label (key or key=value)">
+      </div>
+      <table class="data-table ns-vm-table" id="ns-vms-table">
+        <thead><tr>
+          <th class="check-col"><input type="checkbox" id="ns-vms-check-all" data-i18n-title="vms.tip.checkAll" title="Select all visible VMs"></th>
+          <th class="sortable" data-sort-by="name"          data-i18n-title="vms.tip.sortName" title="Sort by VM name"><span data-i18n="col.vm">VM</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="phase"         data-i18n-title="vms.tip.sortPhase" title="Sort by VMI phase (Running, Stopped, Failed...)"><span data-i18n="col.phase">Phase</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="runStrategy"   data-i18n-title="vms.tip.sortStrategy" title="Sort by run strategy (Always, Halted, RerunOnFailure, Manual)"><span data-i18n="col.runStrategy">RunStrategy</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="cpu"    data-i18n-title="vms.tip.sortCpu" title="Sort by vCPUs"><span data-i18n="col.cpu">CPU</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="memory" data-i18n-title="vms.tip.sortMemory" title="Sort by memory"><span data-i18n="col.memory">Memory</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="ip"     data-i18n-title="vms.tip.sortIp" title="Sort by IP address"><span data-i18n="col.ip">IP address</span> <span class="sort-arrow"></span></th>
+          <th class="sortable" data-sort-by="node"   data-i18n-title="vms.tip.sortNode" title="Sort by node"><span data-i18n="col.node">Node</span> <span class="sort-arrow"></span></th>
+          <th data-i18n="col.action">Actions</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <div class="ns-action-feed">
+        <h4 data-i18n="namespaces.actionProgress">Action progress</h4>
+        <pre id="ns-action-log" class="live-log"></pre>
+      </div>
+    </section>
+
+    <!-- AUTOMATION -->
+    <section id="tab-automation" class="tab-content">
+      <div class="automation-header">
+        <div class="automation-header-text">
+          <h1><span data-icon="robot" data-icon-size="22"></span> <span data-i18n="automation.title">Automation</span></h1>
+          <p class="hint" data-i18n="automation.hint">Provision and manage infrastructure declaratively.</p>
+        </div>
+        <div class="sub-tabs sub-tabs-inline" role="tablist" data-only-for="capi">
+          <button class="sub-tab active" data-capi-tab="install"
+                  data-i18n-title="capi.tab.install.tip" title="Install / uninstall the CAPI + CAPHV controllers on the management cluster"><span class="tab-icon" data-icon="bundle"></span> <span data-i18n="capi.tab.install">Installation</span></button>
+          <button class="sub-tab" data-capi-tab="k8s"
+                  data-i18n-title="capi.tab.k8s.tip" title="List + manage the downstream Kubernetes clusters reconciled by CAPHV"><span class="tab-icon" data-icon="node"></span> <span data-i18n="capi.tab.k8s">Clusters K8S</span></button>
+          <button class="sub-tab" data-capi-tab="services"
+                  data-i18n-title="capi.tab.services.tip" title="Deploy services (Helm charts) on the clusters created by Cluster API"><span class="tab-icon" data-icon="bundle"></span> <span data-i18n="capi.tab.services">Services</span></button>
+        </div>
+      </div>
+
+      <div class="sub-tab-content active" data-subtab="capi">
+
+        <div class="capi-tab-content active" data-capi-tab="install">
+          <div class="card">
+            <div class="card-header">
+              <h2><span data-icon="bundle" data-icon-size="18"></span> <span data-i18n="capi.install.title">Installation CAPI / CAPHV</span></h2>
+              <button class="btn btn-sm btn-secondary" id="btn-capi-refresh" data-i18n="overview.refresh" data-i18n-title="capi.tip.refresh" title="Re-run the diagnostic against the selected cluster">Refresh</button>
+            </div>
+            <div class="card-body" id="capi-status-body">
+              <p class="form-hint" data-i18n="common.loading">Loading…</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="capi-tab-content" data-capi-tab="k8s">
+          <div class="card">
+            <div class="card-header">
+              <h2><span data-icon="node" data-icon-size="18"></span> <span data-i18n="capi.k8s.title">Clusters Kubernetes managés</span></h2>
+              <div>
+                <button class="btn btn-sm btn-primary tip" id="btn-capi-create" data-i18n-title="capi.k8s.t.create" data-tip-i18n="capi.k8s.t.create" title="Open the creation window"><span data-icon="add" data-icon-size="14"></span> <span data-i18n="capi.k8s.create">Create a cluster</span></button>
+                <button class="btn btn-sm btn-secondary" id="btn-capi-k8s-refresh" data-i18n-title="capi.tip.refreshK8s" title="Reload the list of CAPI-managed clusters">Refresh</button>
+              </div>
+            </div>
+            <div class="card-body" id="capi-k8s-body">
+              <p class="form-hint" data-i18n="common.loading">Loading…</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="capi-tab-content" data-capi-tab="services">
+          <div class="card">
+            <div class="card-header">
+              <h2><span data-icon="bundle" data-icon-size="18"></span> <span data-i18n="capi.services.title">Services sur les clusters créés</span></h2>
+              <button class="btn btn-sm btn-secondary" id="btn-capi-services-refresh" data-i18n="overview.refresh" data-i18n-title="capi.tip.refreshServices" title="Reload the services and their state">Refresh</button>
+            </div>
+            <div class="card-body" id="capi-services-body">
+              <p class="form-hint" data-i18n="common.loading">Loading…</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sub-tab-content" data-subtab="terraform">
+        <div class="card">
+          <div class="card-header">
+            <h2><span data-icon="terraform" data-icon-size="18"></span> <span data-i18n="tf.ui.cardTitle">Terraform infrastructure</span></h2>
+            <button class="btn btn-sm btn-secondary" id="btn-tf-refresh" data-i18n="overview.refresh" data-i18n-title="tf.tip.refresh" title="Refresh provider info + state">Refresh</button>
+          </div>
+          <div class="card-body" id="tf-status-body">
+            <p class="form-hint">Loading…</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="sub-tab-content" data-subtab="pxe">
+        <div class="card">
+          <div class="card-header">
+            <h2><span data-icon="baremetal" data-icon-size="18"></span> Bare-metal (BMC / Redfish)</h2>
+            <button class="btn btn-sm btn-secondary" id="btn-bmc-refresh" data-i18n-title="bmc.tip.refresh" title="Re-render the discovery panel">Refresh</button>
+          </div>
+          <div class="card-body" id="bmc-body">
+            <p class="form-hint">Loading…</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ALL VMS : v1.85.0, les VMs de tous les clusters -->
+    <section id="tab-allvms" class="tab-content">
+      <h1 data-i18n="avm.title">All clusters VMs</h1>
+      <p class="hint" data-i18n="avm.hint">Every VM of every declared cluster, in one list. Click clusters to keep only theirs, filter by state, namespace or text, sort any column; the selection can span clusters. A cluster that is off or refuses the read is shown as such.</p>
+      <div class="avm-host" id="all-vms-host"></div>
+    </section>
+
+    <!-- MIGRATIONS (ALL CLUSTERS) : v1.76.0, vue globale des vagues Forklift -->
+    <section id="tab-forkliftglobal" class="tab-content">
+      <h1 data-i18n="fkg.title">Migrations (all clusters)</h1>
+      <p class="hint" data-i18n="fkg.hint">Every VMware migration wave on every declared cluster, in one table. An unreachable cluster is shown as such, without blocking the others.</p>
+      <div class="na-host" id="forklift-global-host"></div>
+    </section>
+
+    <!-- ACTIVITY (merged Actions + Logs) -->
+    <section id="tab-activity" class="tab-content">
+      <h1 data-i18n="activity.title">Activity</h1>
+      <p class="hint" data-i18n="activity.hint">Currently running actions appear at the top. Completed actions and historical log files appear below.</p>
+
+      <div class="toggle-row">
+        <label class="switch">
+          <input type="checkbox" id="dock-toggle" checked>
+          <span class="slider-toggle"></span>
+        </label>
+        <span data-i18n="activity.pinDock">Always show running actions at the bottom of the interface</span>
+        <span class="form-hint" data-i18n="activity.pinDockHint">Stays visible across all tabs.</span>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h2 data-i18n="activity.inProgress">In progress</h2></div>
+        <table class="data-table" id="activity-running">
+          <thead><tr>
+            <th data-i18n="col.id">ID</th>
+            <th data-i18n="header.cluster">Cluster</th>
+            <th data-i18n="col.action">Action</th>
+            <th data-i18n="col.status">Status</th>
+            <th data-i18n="col.started">Started</th>
+            <th></th>
+          </tr></thead>
+          <tbody><tr><td colspan="6" class="empty-state" data-i18n="activity.noneRunning">No action currently running.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2 data-i18n="activity.history">History</h2>
+          <div class="activity-filters">
+            <select id="act-f-cluster" class="tip" data-tip-i18n="activity.filter.clusterTip"
+                    aria-label="Cluster"></select>
+            <select id="act-f-status" class="tip" data-tip-i18n="activity.filter.statusTip"
+                    aria-label="Status"></select>
+            <select id="act-f-action" class="tip" data-tip-i18n="activity.filter.actionTip"
+                    aria-label="Action"></select>
+            <input type="search" id="act-f-q" class="tip" data-tip-i18n="activity.filter.searchTip"
+                   data-i18n-placeholder="activity.filter.search" placeholder="Search…">
+            <button class="btn btn-sm btn-secondary tip" id="btn-act-filter-reset"
+                    data-tip-i18n="activity.filter.resetTip"
+                    data-i18n="activity.filter.reset" hidden>Reset</button>
+            <span class="form-hint" id="act-filter-count"></span>
+          </div>
+        </div>
+        <div class="activity-history-scroll">
+          <table class="data-table sortable" id="activity-history">
+            <thead><tr>
+              <th></th>
+              <th data-sort="kind"     data-i18n="col.type">Type</th>
+              <th data-sort="cluster"  data-i18n="header.cluster">Cluster</th>
+              <th data-sort="action"   data-i18n="col.action">Action</th>
+              <th data-sort="status"   data-i18n="col.status">Status</th>
+              <th data-sort="ts"       data-i18n="col.started">Started/Date</th>
+              <th data-sort="duration" data-i18n="col.duration">Duration</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" id="activity-log-card" style="display:none;">
+        <div class="card-header">
+          <h2 id="activity-log-title">Log</h2>
+          <button class="btn btn-sm btn-secondary" id="btn-activity-log-close">×</button>
+        </div>
+        <pre id="activity-log-content" class="live-log" style="height: 360px;"></pre>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- =========================================================================
+     SETTINGS MODAL
+     ========================================================================= -->
+<div class="modal-overlay" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" aria-hidden="true">
+  <div class="modal modal-large">
+    <div class="modal-header">
+      <div>
+        <h3 id="settings-modal-title" data-i18n="settings.title">Settings</h3>
+        <div class="modal-subtitle" data-i18n="settings.subtitle">Configure harvester-ops</div>
+      </div>
+      <button class="btn-close" id="btn-close-settings" data-i18n-title="settings.close" title="Close" aria-label="Close">×</button>
+    </div>
+    <div class="settings-tabs">
+      <button class="settings-tab active" data-stab="general"    data-i18n="settings.tab.general">General</button>
+      <button class="settings-tab"        data-stab="appearance" data-i18n="settings.tab.appearance">Appearance</button>
+      <button class="settings-tab"        data-stab="language"   data-i18n="settings.tab.language">Language</button>
+      <button class="settings-tab"        data-stab="clusters"   data-i18n="settings.tab.clusters">Clusters</button>
+      <button class="settings-tab"        data-stab="connection" data-i18n="settings.tab.connection">Connection</button>
+      <button class="settings-tab needs-admin" data-stab="rancher" data-i18n="settings.tab.rancher">Rancher sign-in</button>
+      <button class="settings-tab needs-admin" data-stab="accounts" data-i18n="settings.tab.accounts">Console accounts</button>
+      <button class="settings-tab"        data-stab="husers"     data-i18n="settings.tab.husers">Cluster accounts</button>
+      <button class="settings-tab"        data-stab="support"    data-i18n="settings.tab.support">Support</button>
+      <button class="settings-tab"        data-stab="about"      data-i18n="settings.tab.about">About</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="settings-tab-content active" id="stab-general">
+        <h4 data-i18n="settings.general.title">General</h4>
+        <div class="form-row">
+          <label data-i18n="settings.general.titleLabel">Interface title</label>
+          <input type="text" id="set-title" maxlength="40">
+          <div class="form-hint" data-i18n="settings.general.titleHint">Shown in the sidebar and browser tab.</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="btn-reset-title" data-i18n="settings.general.reset">Reset to default</button>
+      </div>
+
+      <!-- v1.57.0 : les comptes de la console (administrateurs) -->
+      <div class="settings-tab-content" id="stab-accounts">
+        <h4 data-i18n="accounts.title">Console accounts</h4>
+        <p class="form-hint" data-i18n="accounts.intro">Who can sign in to this console, and with which role. Accounts from the installer (htpasswd) are managed on the server.</p>
+        <div id="accounts-feedback" class="res-feedback"></div>
+        <div id="accounts-body"><p class="form-hint">…</p></div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-husers">
+        <h4 data-i18n="husers.title">Cluster accounts</h4>
+        <p class="form-hint" data-i18n="husers.intro">Accounts declared on the
+          selected Harvester cluster, and who holds cluster administration.</p>
+        <div id="husers-body"><p class="form-hint">…</p></div>
+        <!-- v1.73.0 : les membres du cluster dans Rancher, avec leurs rôles -->
+        <h4 data-i18n="rm.clusterTitle">Members in Rancher</h4>
+        <p class="form-hint" data-i18n="rm.clusterIntro">Who Rancher gives rights on this cluster, and with which role.</p>
+        <div id="rmembers-body"></div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-appearance">
+        <h4 data-i18n="settings.appearance.title">Appearance</h4>
+
+        <div class="form-row">
+          <label data-i18n="settings.appearance.theme">Theme</label>
+          <select id="set-theme" class="form-select">
+            <option value="suse"       data-i18n="settings.appearance.theme.suse">SUSE Slate</option>
+            <option value="nord"       data-i18n="settings.appearance.theme.nord">Nord</option>
+            <option value="solarized"  data-i18n="settings.appearance.theme.solarized">Solarized</option>
+            <option value="catppuccin" data-i18n="settings.appearance.theme.catppuccin">Catppuccin</option>
+            <option value="tokyo"      data-i18n="settings.appearance.theme.tokyo">Tokyo Night</option>
+          </select>
+          <div class="form-hint" data-i18n="settings.appearance.themeHint">Switches the colour palette of the whole UI. Applied instantly.</div>
+        </div>
+
+        <div class="form-row">
+          <label data-i18n="settings.appearance.mode">Mode</label>
+          <select id="set-mode" class="form-select">
+            <option value="dark"  data-i18n="settings.appearance.mode.dark">Dark</option>
+            <option value="light" data-i18n="settings.appearance.mode.light">Light</option>
+          </select>
+          <div class="form-hint" data-i18n="settings.appearance.modeHint">Light and dark variants of the selected theme.</div>
+        </div>
+
+        <hr style="margin: 18px 0; border: none; border-top: 1px solid var(--border);">
+
+        <div class="form-row">
+          <label data-i18n="settings.appearance.logo">Logo</label>
+          <div class="logo-preview-wrap">
+            <img id="logo-preview" src="" alt="" class="logo-preview" style="display:none;">
+            <span id="logo-preview-empty" class="logo-empty" data-icon="brand" data-icon-size="28"></span>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:10px;">
+            <label class="btn btn-secondary btn-sm">
+              <input type="file" id="set-logo" accept="image/*" style="display:none;">
+              <span data-i18n="settings.appearance.uploadLogo">Upload logo</span>
+            </label>
+            <button class="btn btn-secondary btn-sm" id="btn-remove-logo" data-i18n="settings.appearance.removeLogo">Remove logo</button>
+          </div>
+          <div class="form-hint" data-i18n="settings.appearance.logoHint">PNG/JPG/SVG, up to ~256KB.</div>
+        </div>
+
+        <div class="form-row">
+          <label>
+            <span data-i18n="settings.appearance.logoSize">Logo size</span>
+            <span class="slider-value" id="logo-size-value">24px</span>
+          </label>
+          <input type="range" id="set-logo-size" min="16" max="64" step="2" value="24" class="slider">
+        </div>
+
+        <div class="form-row">
+          <label>
+            <span data-i18n="settings.appearance.titleSize">Title size</span>
+            <span class="slider-value" id="title-size-value">16px</span>
+          </label>
+          <input type="range" id="set-title-size" min="11" max="26" step="1" value="16" class="slider">
+        </div>
+
+        <button class="btn btn-secondary btn-sm" id="btn-reset-sizes" data-i18n="settings.appearance.resetSizes">Reset sizes to default</button>
+
+        <div class="form-row" style="margin-top:24px;">
+          <label class="opt-row">
+            <input type="checkbox" id="set-tooltips" checked>
+            <span><strong data-i18n="settings.appearance.tooltipsLabel">Show tooltips on UI elements</strong>
+              <span class="opt-hint" data-i18n="settings.appearance.tooltipsHint">When enabled, hovering over icons and buttons shows an explanation of what they do.</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-language">
+        <h4 data-i18n="settings.language.title">Interface language</h4>
+        <div class="lang-grid" id="lang-grid"></div>
+        <div class="form-hint" data-i18n="settings.language.hint">The language is stored in your browser.</div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-clusters">
+        <h4 data-i18n="settings.clusters.title">Cluster declarations</h4>
+        <p class="form-hint" data-i18n="settings.clusters.hint">Manage the clusters this instance can operate. Clusters added here are kept in the console's state directory; those of config.yaml belong to the operator.</p>
+        <div style="margin: 10px 0;">
+          <button class="btn btn-primary btn-sm" id="btn-clusters-add" data-i18n="clusters.add">+ Add cluster</button>
+          <button class="btn btn-secondary btn-sm" id="btn-clusters-refresh" data-i18n="overview.refresh">Refresh</button>
+        </div>
+        <div id="clusters-list" class="clusters-list"></div>
+      </div>
+
+      <!-- v1.79.0 : les Rancher par lesquels on se connecte, réglés à chaud -->
+      <div class="settings-tab-content" id="stab-rancher">
+        <h4 data-i18n="rsrv.title">Sign-in through Rancher</h4>
+        <p class="form-hint" data-i18n="rsrv.intro">The Rancher servers people can sign in through. Changes apply at once, without a restart. Entries of config.yaml belong to the operator and are read-only here.</p>
+        <div style="margin: 10px 0;">
+          <button type="button" class="btn btn-primary btn-sm tip" data-rsrv="add" data-i18n="rsrv.add" data-tip-i18n="rsrv.addTip">+ Add a Rancher</button>
+          <button type="button" class="btn btn-secondary btn-sm tip" data-rsrv="refresh" data-i18n="overview.refresh" data-tip-i18n="rsrv.refreshTip">Refresh</button>
+        </div>
+        <div id="rsrv-feedback" class="res-feedback"></div>
+        <div id="rsrv-list" class="clusters-list"></div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-connection">
+        <h4 data-i18n="settings.connection.title">Cluster connectivity</h4>
+
+        <div class="form-row">
+          <label data-i18n="settings.connection.targetCluster">Target cluster</label>
+          <select id="conn-cluster-select" class="form-select"></select>
+          <div class="form-hint" data-i18n="settings.connection.hint">Validates kubectl, permissions and SSH reachability.</div>
+        </div>
+
+        <button class="btn btn-primary btn-sm" id="btn-test-conn" data-i18n="settings.connection.test">Test connection</button>
+        <button class="btn btn-secondary btn-sm" id="btn-list-clusters" data-i18n="settings.connection.listAll">List all configured clusters</button>
+
+        <div id="conn-diag" class="conn-diag" style="display:none;"></div>
+
+        <div id="conn-clusters" class="conn-clusters" style="display:none; margin-top:18px;"></div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-support">
+        <h4 data-i18n="settings.support.title">Support bundle</h4>
+        <p class="form-hint" data-i18n="settings.support.hint">Collects logs, configuration (sanitized) and cluster snapshots into a single tar.gz archive for support cases.</p>
+        <label class="opt-row" style="margin-top:14px;">
+          <input type="checkbox" id="sup-anonymize" checked>
+          <span><strong data-i18n="settings.support.anonymize">Anonymize sensitive data</strong>
+            <span class="opt-hint" data-i18n="settings.support.anonymizeHint">Replaces IPs, hostnames, VM and namespace names with unique unambiguous placeholders (&lt;&lt;NODE-1&gt;&gt;, &lt;&lt;IP-NODE-1&gt;&gt;, &lt;&lt;VM-1&gt;&gt;...). The full correspondence table is included as <code>mapping.json</code> inside the archive AND available as a separate download — keep it safe to be able to de-anonymize logs later.</span>
+          </span>
+        </label>
+        <div style="margin-top:14px; display:flex; gap:8px;">
+          <button class="btn btn-primary btn-sm" id="btn-build-bundle" data-i18n="settings.support.build">Build bundle</button>
+          <button class="btn btn-secondary btn-sm" id="btn-show-bundles" data-i18n="settings.support.history">Past bundles</button>
+        </div>
+        <div id="bundle-history" class="bundle-history" style="display:none; margin-top:14px;"></div>
+
+        <hr style="margin: 22px 0; border: none; border-top: 1px solid var(--border);">
+
+        <h4 data-i18n="settings.support.deanonTitle">De-anonymize a log file</h4>
+        <p class="form-hint" data-i18n="settings.support.deanonHint">Restore original cluster/host/VM names in a log file. Provide the modified log AND the corresponding <code>mapping.json</code> from the original bundle.</p>
+        <div class="form-row">
+          <label data-i18n="settings.support.deanonLog">Anonymized log file</label>
+          <input type="file" id="deanon-log" accept=".log,.txt,.json">
+        </div>
+        <div class="form-row">
+          <label data-i18n="settings.support.deanonMapping">Mapping file (mapping.json)</label>
+          <input type="file" id="deanon-mapping" accept=".json">
+        </div>
+        <button class="btn btn-primary btn-sm" id="btn-deanonymize" data-i18n="settings.support.deanonRun">De-anonymize and download</button>
+        <div id="deanon-result" class="form-hint" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="settings-tab-content" id="stab-about">
+        <h4 data-i18n="settings.about.title">About</h4>
+        <table class="about-table">
+          <tr><td data-i18n="settings.about.version">Version</td><td><code>v1.86.0</code>
+            <button type="button" class="btn btn-secondary btn-sm tip" id="btn-about-versions"
+                    data-tip-i18n="versions.openTip" data-i18n-title="versions.openTip"
+                    data-i18n="versions.open" title="What each version brought">Version history</button></td></tr>
+          <tr><td data-i18n="settings.about.license">License</td><td><code>Apache-2.0</code></td></tr>
+          <tr><td data-i18n="settings.about.docs">Documentation</td><td><code>/opt/harvester-ops/docs/</code></td></tr>
+        </table>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- v1.56.0 : historique des versions, lu dans CHANGELOG.md -->
+<div class="modal-overlay" id="versions-modal" role="dialog" aria-modal="true" aria-labelledby="versions-modal-title" aria-hidden="true">
+  <div class="modal modal-large versions-modal">
+    <div class="modal-header">
+      <div>
+        <h3 id="versions-modal-title" data-i18n="versions.title">Version history</h3>
+        <div class="modal-subtitle" data-i18n="versions.subtitle">What each version brought (release notes in English)</div>
+      </div>
+      <button class="btn-close" id="btn-close-versions" data-i18n-title="common.close" title="Close" aria-label="Close">×</button>
+    </div>
+    <!-- v1.82.0 : historique, et mise à jour de la console -->
+    <div class="sub-tabs sub-tabs-inline versions-panes" role="tablist">
+      <button type="button" class="sub-tab active tip" data-vpane="history" data-i18n="upd.tab.history"
+              data-tip-i18n="upd.tab.historyTip" data-i18n-title="upd.tab.historyTip" title="What each version brought">History</button>
+      <button type="button" class="sub-tab tip" data-vpane="update" data-i18n="upd.tab.update"
+              data-tip-i18n="upd.tab.updateTip" data-i18n-title="upd.tab.updateTip" title="Update this console, online or from an archive">Update</button>
+    </div>
+    <div id="versions-pane-history">
+    <div class="versions-tools">
+      <input type="search" id="versions-filter" class="tip" data-i18n-placeholder="versions.filter"
+             placeholder="Filter (word, version)" data-tip-i18n="versions.filterTip" data-i18n-title="versions.filterTip"
+             title="Keep only the versions whose notes contain these words">
+      <div class="sub-tabs sub-tabs-inline versions-kinds" role="tablist">
+        <button type="button" class="sub-tab active tip" data-vkind="all" data-i18n="versions.kind.all"
+                data-tip-i18n="versions.kind.allTip" data-i18n-title="versions.kind.allTip" title="Every change">All changes</button>
+        <button type="button" class="sub-tab tip" data-vkind="added" data-i18n="versions.kind.added"
+                data-tip-i18n="versions.kind.addedTip" data-i18n-title="versions.kind.addedTip" title="Only what was added">Additions</button>
+        <button type="button" class="sub-tab tip" data-vkind="fixed" data-i18n="versions.kind.fixed"
+                data-tip-i18n="versions.kind.fixedTip" data-i18n-title="versions.kind.fixedTip" title="Only what was fixed">Fixes</button>
+      </div>
+    </div>
+    <div class="modal-body versions-body" id="versions-body"></div>
+    </div>
+    <div class="modal-body versions-body upd-pane" id="versions-pane-update" hidden></div>
+  </div>
+</div>
+
+<!-- =========================================================================
+     BOTTOM DOCK — persistent running actions panel
+     ========================================================================= -->
+<div id="bottom-dock" class="bottom-dock" style="display:none;">
+  <div class="dock-resize-handle" id="dock-resize-handle" data-i18n-title="dock.resize" title="Drag to resize"></div>
+  <div class="bottom-dock-header">
+    <span class="dock-title"><span data-icon="running" class="icon-run"></span> <span data-i18n="dock.runningActions">Running actions</span> <span class="dock-count" id="dock-count">0</span></span>
+    <div class="dock-header-actions">
+      <button class="btn-icon-sm" id="btn-dock-collapse" data-i18n-title="dock.collapse" title="Collapse"><span data-icon="chevronDown" data-icon-size="14"></span></button>
+      <button class="btn-icon-sm" id="btn-dock-hide" data-i18n-title="dock.hide" title="Hide">×</button>
+    </div>
+  </div>
+  <div class="bottom-dock-body" id="bottom-dock-body">
+    <div class="dock-empty" id="dock-empty" data-i18n="dock.idle">No action running. The cluster is idle.</div>
+    <div class="dock-list" id="dock-list"></div>
+  </div>
+</div>
+
+<!-- =========================================================================
+     DOCS FLOATING PANEL — draggable + resizable
+     ========================================================================= -->
+<div id="docs-panel" class="docs-panel" style="display:none;">
+  <div class="docs-header" id="docs-drag-handle">
+    <span class="docs-title"><span data-icon="docs"></span> <span data-i18n="docs.title">Documentation</span></span>
+    <div class="docs-header-actions">
+      <select id="docs-lang">
+        <option value="en">EN</option>
+        <option value="fr">FR</option>
+      </select>
+      <button class="btn-icon-sm" id="btn-docs-min" data-i18n-title="docs.minimize" title="Minimize">_</button>
+      <button class="btn-icon-sm" id="btn-docs-close" data-i18n-title="docs.close" title="Close">×</button>
+    </div>
+  </div>
+  <div class="docs-body">
+    <aside class="docs-toc">
+      <ul id="docs-toc-list"></ul>
+    </aside>
+    <main class="docs-content" id="docs-content">
+      <p class="hint" data-i18n="docs.selectFile">Select a document from the list.</p>
+    </main>
+  </div>
+  <div class="docs-resizer" id="docs-resizer"></div>
+</div>
+
+<!-- =========================================================================
+     SUPPORT BUNDLE FLOATING PROGRESS PANEL
+     ========================================================================= -->
+<div id="support-panel" class="support-panel" style="display:none;">
+  <div class="support-header" id="support-drag-handle">
+    <span class="support-title"><span data-icon="bundle"></span> <span data-i18n="support.progress.title">Support bundle</span></span>
+    <div class="support-header-actions">
+      <button class="btn-icon-sm" id="btn-support-min" data-i18n-title="support.progress.minimize" title="Minimize">_</button>
+      <button class="btn-icon-sm" id="btn-support-close" data-i18n-title="support.progress.close" title="Close">×</button>
+    </div>
+  </div>
+  <div class="support-body">
+    <div class="support-progress-bar">
+      <div class="support-progress-fill" id="support-progress-fill" style="width: 0%"></div>
+    </div>
+    <div class="support-progress-pct" id="support-progress-pct">0%</div>
+    <ol class="support-steps" id="support-steps"></ol>
+    <div class="support-actions" id="support-result" style="display:none;"></div>
+  </div>
+</div>
+
+<!-- Minimized bubble for backgrounded support bundle progress -->
+<div id="support-bubble" class="support-bubble" style="display:none;">
+  <span data-icon="bundle"></span> <span id="support-bubble-pct">0%</span>
+</div>
+
+<script src="static/js/i18n.js"></script>
+<script src="static/js/icons.js"></script>
+<script src="static/js/copy.js"></script>
+<script src="static/js/theme.js"></script>
+<script src="static/js/veil.js"></script>
+<script src="static/js/sse-reconnect.js"></script>
+<script src="static/js/floating-panels.js"></script>
+<script src="static/js/settings.js"></script>
+<script src="static/js/docs.js"></script>
+<script src="static/js/support.js"></script>
+<script src="static/js/tooltips.js"></script>
+<script src="static/js/dock.js"></script>
+<script src="static/js/vm-edit.js"></script>
+<script src="static/js/vm-create.js"></script>
+<script src="static/js/rancher-members.js"></script>
+<script src="static/js/harvester-users.js"></script>
+<script src="static/js/vm-console.js"></script>
+<script src="static/js/vm-snapshots.js"></script>
+<script src="static/js/xfer-progress.js"></script>
+<script src="static/js/vm-transfer.js"></script>
+<script src="static/js/vm-migrate.js"></script>
+<script src="static/js/clusters.js"></script>
+<script src="static/js/capi-create.js"></script>
+<script src="static/js/capi.js"></script>
+<script src="static/js/tf-schema.js"></script>
+<script src="static/js/tf-form.js"></script>
+<script src="static/js/tf-declarations.js"></script>
+<script src="static/js/tf-decl-view.js"></script>
+<script src="static/js/terraform.js"></script>
+<script src="static/js/bmc.js"></script>
+<script src="static/js/bm-profiles.js"></script>
+<script src="static/js/board.js"></script>
+<script src="static/js/fabric.js"></script>
+<script src="static/js/netmap.js"></script>
+<script src="static/js/vpc.js"></script>
+<script src="static/js/capi-services.js"></script>
+<script src="static/js/storage-map.js"></script>
+<script src="static/js/cluster-map.js"></script>
+<script src="static/js/resource-views.js"></script>
+<script src="static/js/sections.js"></script>
+<script src="static/js/backups.js"></script>
+<script src="static/js/object-forms.js"></script>
+<script src="static/js/yaml-window.js"></script>
+<script src="static/js/vm-actions.js"></script>
+  <script src="static/js/host-settings.js"></script>
+  <script src="static/js/namespaces.js"></script>
+  <script src="static/js/events.js"></script>
+  <script src="static/js/storage-actions.js"></script>
+  <script src="static/js/templates.js"></script>
+  <script src="static/js/netadmin.js"></script>
+  <script src="static/js/ovnextra.js"></script>
+  <script src="static/js/advanced.js"></script>
+  <script src="static/js/devices.js"></script>
+  <script src="static/js/upgrade.js"></script>
+  <script src="static/js/monlog.js"></script>
+  <script src="static/js/vmimport.js"></script>
+  <script src="static/js/forklift-lanes.js"></script>
+  <script src="static/js/forklift.js"></script>
+  <script src="static/js/forklift-global.js"></script>
+  <script src="static/js/all-vms.js"></script>
+<script src="static/js/versions.js"></script>
+<script src="static/js/console-update.js"></script>
+<script src="static/js/console-accounts.js"></script>
+<script src="static/js/rancher-servers.js"></script>
+<script src="static/js/user-menu.js"></script>
+<script src="static/js/access-notice.js"></script>
+<!-- Yjs notes module (ESM) -->
+<script type="module" src="static/js/notes.js"></script>
+<script src="static/js/app.js"></script>
+<script src="demo-banner.js"></script>
+</body>
+</html>

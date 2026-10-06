@@ -1,0 +1,2611 @@
+/**
+ * harvester-ops — VM edit panel (stage 3: visual disk & network editors).
+ *
+ * Sections:
+ *   - General   (description, runStrategy)
+ *   - Compute   (CPU sockets/cores/threads, memory.guest)
+ *   - Disks     (v1.8.0: card-based editor over volumes + devices.disks +
+ *                the harvesterhci.io/volumeClaimTemplates annotation for
+ *                NEW disks — blank or from a Harvester image. Raw JSON
+ *                stays available behind an "advanced" fold.)
+ *   - Network   (v1.8.0: card-based editor over networks + interfaces)
+ *   - Cloud-init (separate Secret patch via /cloudinit endpoint)
+ *   - Lifecycle (terminationGracePeriodSeconds, evictionStrategy)
+ *
+ * The card editors reuse the TFForm engine (schema-driven fields, ref
+ * dropdowns fed by /api/{pvcs,images,storageclasses,networks}, repeatable
+ * blocks). KubeVirt models disks/networks as PAIRS of arrays joined by
+ * name (volumes[]<->devices.disks[], networks[]<->devices.interfaces[]);
+ * the mappers below flatten for the form and rebuild FULL arrays for the
+ * merge patch (merge patch replaces arrays wholesale). Volumes the form
+ * does not understand (cloud-init, containerDisk, lun…) are carried
+ * through untouched.
+ */
+const VMEdit = (() => {
+  const tr = (k, fb) => {
+    try { const v = window.i18n && i18n.t(k); return v && v !== k ? v : fb; }
+    catch { return fb; }
+  };
+
+  const SECTIONS = [
+    { id: 'general',   label: () => tr('vm.edit.general', 'General'),      icon: 'general' },
+    { id: 'compute',   label: () => tr('vm.edit.compute', 'Compute'),      icon: 'compute' },
+    { id: 'firmware',  label: () => tr('vm.edit.firmware', 'Firmware'),    icon: 'firmware' },
+    { id: 'disks',     label: () => tr('vm.edit.disks', 'Disks'),          icon: 'disk' },
+    { id: 'network',   label: () => tr('vm.edit.network', 'Network'),      icon: 'network' },
+    { id: 'cloudinit', label: () => tr('vm.edit.cloudinit', 'Cloud-init'), icon: 'cloud' },
+    { id: 'placement', label: () => tr('vm.edit.placement', 'Placement'),  icon: 'placement' },
+    { id: 'lifecycle', label: () => tr('vm.edit.lifecycle', 'Lifecycle'),  icon: 'lifecycle' },
+  ];
+
+  // Per-open refresh callbacks. v1.6.x stored this on the panel API object
+  // but looked it up on the DOM node — Reset and post-Apply refresh were
+  // silently dead. A module registry keyed by panel id is unambiguous.
+  const refreshers = new Map();
+
+  // =========================================================================
+  // Schemas for the TFForm engine (NOT registered in TF_SCHEMA — passed as
+  // objects; test_tf_schema.py asserts every TF_SCHEMA kind has an HCL
+  // backend branch, which these editors do not have or need).
+  // =========================================================================
+  const K8S_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+  const MAC_RE = /^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/;
+
+  // v1.8.3 : premier nom libre pour une nouvelle carte de liste
+  // (eth0 pris -> eth1…) — sans quoi +Add dupliquait le nom d'un
+  // voisin en rejouant le default du schéma.
+  function nextFree(prefix, start, used) {
+    const have = new Set((used || []).filter(Boolean));
+    for (let n = start; n < start + 99; n++) {
+      if (!have.has(prefix + n)) return prefix + n;
+    }
+    return prefix + start;
+  }
+  function nextFreeDev(used) {
+    const have = new Set((used || []).filter(Boolean));
+    for (const c of 'bcdefghijklmnopqrstuvwxyz') {
+      if (!have.has('/dev/vd' + c)) return '/dev/vd' + c;
+    }
+    return '/dev/vdb';
+  }
+
+  const DISK_SCHEMA = {
+    id: 'vm-disks',
+    nested: {
+      disk: {
+        min: 0, max: 16,
+        label: { en: 'Disks', fr: 'Disques' },
+        itemTitle: (v) => ({ icon: 'disk', text:
+          `${v.name || tr('vm.edit.newDisk', 'new disk')}`
+          + `${v.bus ? ' — ' + v.bus : ''}${v.size ? ' · ' + v.size : ''}`
+          + `${v.boot_order > 0 ? ' · boot #' + v.boot_order : ''}` }),
+        // Le premier disque doit faire DÉMARRER la VM, donc une image ; les
+        // suivants sont des disques de données, donc vierges. Le défaut était
+        // `pvc` (attacher un volume existant), de loin le cas le plus rare :
+        // or ce mode masque Taille et Storage class, puisque le PVC porte déjà
+        // les siennes. À l'écran, la création d'une VM s'ouvrait donc sans
+        // champ de taille, et on la croyait oubliée.
+        newItem: (items) => ({
+          name: nextFree('disk-', 1, items.map(i => i.name)),
+          source: items.length === 0 ? 'image' : 'blank',
+        }),
+        args: [
+          { name: 'name', type: 'text', required: true, validate: K8S_NAME_RE,
+            label: { en: 'Name', fr: 'Nom' },
+            description: { en: 'Joins the volume and the guest device (RFC 1123)',
+                           fr: 'Relie le volume au périphérique invité (RFC 1123)' } },
+          { name: 'device', type: 'enum', default: 'disk', enum_values: ['disk', 'cdrom'],
+            label: { en: 'Device', fr: 'Périphérique' },
+            description: { en: 'How the guest sees it', fr: 'Ce que voit l’invité' } },
+          { name: 'bus', type: 'enum', default: 'virtio', enum_values: ['virtio', 'sata', 'scsi'],
+            label: { en: 'Bus', fr: 'Bus' },
+            description: { en: 'virtio is fastest; sata/scsi for guests without virtio drivers',
+                           fr: 'virtio est le plus rapide ; sata/scsi pour les invités sans pilotes virtio' } },
+          { name: 'boot_order', type: 'int', default: 0, min: 0, max: 64,
+            label: { en: 'Boot order', fr: 'Ordre de boot' },
+            description: { en: '0 = not part of the boot order',
+                           fr: '0 = hors de l’ordre de boot' } },
+          { name: 'source', type: 'enum', default: 'pvc',
+            enum_values: ['pvc', 'image', 'blank'],
+            label: { en: 'Volume source', fr: 'Source du volume' },
+            description: { en: 'pvc = attach an existing volume · image = NEW disk from a Harvester image · blank = NEW empty disk',
+                           fr: 'pvc = attacher un volume existant · image = NOUVEAU disque depuis une image Harvester · blank = NOUVEAU disque vierge' } },
+          { name: 'pvc', type: 'ref', ref_endpoint: '/api/pvcs', ref_namespaced: true,
+            label: { en: 'Existing PVC', fr: 'PVC existant' },
+            description: { en: 'Must live in the VM’s namespace',
+                           fr: 'Doit être dans le namespace de la VM' } },
+          { name: 'image', type: 'ref', ref_endpoint: '/api/images', ref_namespaced: true,
+            ref_label_field: 'display_name',
+            label: { en: 'VM image', fr: 'Image VM' },
+            description: { en: 'The new PVC inherits the image’s storage class',
+                           fr: 'Le nouveau PVC hérite de la storage class de l’image' } },
+          { name: 'size', type: 'text', validate: /^[0-9]+(Mi|Gi|Ti)$/,
+            suggest: ['10Gi', '20Gi', '40Gi', '80Gi', '100Gi', '200Gi'],
+            label: { en: 'Size (new disk)', fr: 'Taille (nouveau disque)' },
+            description: { en: 'e.g. 10Gi — for image sources, at least the image size',
+                           fr: 'ex. 10Gi — pour une image, au moins la taille de l’image' } },
+          { name: 'storage_class', type: 'ref', ref_endpoint: '/api/storageclasses',
+            label: { en: 'Storage class', fr: 'Storage class' },
+            description: { en: 'Blank disks only (image disks inherit theirs); empty = cluster default',
+                           fr: 'Disques vierges seulement (hérité pour les images) ; vide = défaut du cluster' } },
+          { name: 'serial', type: 'text', validate: /^[A-Za-z0-9_.+-]{0,36}$/,
+            label: { en: 'Serial', fr: 'Numéro de série' },
+            description: { en: 'Shown to the guest (/dev/disk/by-id) — handy to identify a disk from inside the VM',
+                           fr: 'Vu par l’invité (/dev/disk/by-id) — pratique pour identifier un disque depuis la VM' } },
+          { name: 'cache', type: 'enum', enum_values: ['none', 'writethrough', 'writeback'],
+            label: { en: 'Cache mode', fr: 'Mode de cache' },
+            description: { en: 'Empty = hypervisor default. none is the safest for shared storage',
+                           fr: 'Vide = défaut de l’hyperviseur. none est le plus sûr sur stockage partagé' } },
+          { name: 'shareable', type: 'bool', default: false,
+            label: { en: 'Shareable', fr: 'Partageable' },
+            description: { en: 'Allows several VMs to attach this volume (clustering) — the guests must coordinate writes',
+                           fr: 'Permet à plusieurs VMs d’attacher ce volume (clustering) — aux invités de coordonner les écritures' } },
+          { name: 'readonly', type: 'bool', default: false,
+            label: { en: 'Read-only', fr: 'Lecture seule' },
+            description: { en: 'The guest cannot write to it (typical for an ISO)',
+                           fr: 'L’invité ne peut pas y écrire (typique d’une ISO)' } },
+          { name: 'io_thread', type: 'bool', default: false,
+            label: { en: 'Dedicated I/O thread', fr: 'Thread d’E/S dédié' },
+            description: { en: 'A thread of its own for this disk — helps a latency-sensitive workload',
+                           fr: 'Un thread rien que pour ce disque — utile pour une charge sensible à la latence' } },
+        ],
+      },
+    },
+  };
+
+  // v1.12.0 — tags Harvester (labels tag.harvesterhci.io/<clé>) éditables
+  // comme dans l'UI Harvester : ils servent au filtrage et aux inventaires.
+  const TAG_SCHEMA = {
+    id: 'vm-tags',
+    nested: {
+      tag: {
+        min: 0, max: 20,
+        label: { en: 'Tags', fr: 'Tags' },
+        itemTitle: (v) => ({ icon: 'tag', text:
+          `${v.key || tr('vm.edit.newTag', 'new tag')}${v.value ? ' = ' + v.value : ''}` }),
+        newItem: (items) => ({ key: nextFree('tag-', 1, items.map(i => i.key)) }),
+        args: [
+          { name: 'key', type: 'text', required: true, validate: /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/,
+            suggest: ['app', 'purpose', 'case', 'ssh-user', 'owner', 'env'],
+            label: { en: 'Key', fr: 'Clé' },
+            description: { en: 'Stored as tag.harvesterhci.io/<key>',
+                           fr: 'Stocké en tag.harvesterhci.io/<clé>' } },
+          { name: 'value', type: 'text',
+            label: { en: 'Value', fr: 'Valeur' },
+            description: { en: 'Free text (Kubernetes label value rules)',
+                           fr: 'Texte libre (règles de valeur de label Kubernetes)' } },
+        ],
+      },
+    },
+  };
+
+  // v1.13.0 — placement. On n'écrit QUE nodeSelector et les règles pod :
+  // la nodeAffinity est gérée par Harvester (contrainte réseau) et serait
+  // écrasée si on la republiait — le merge patch préserve les clés sœurs.
+  const NODESEL_SCHEMA = {
+    id: 'vm-nodeselector',
+    nested: {
+      sel: {
+        min: 0, max: 10,
+        label: { en: 'Node selector', fr: 'Sélecteur de node' },
+        itemTitle: (v) => ({ icon: 'placement', text:
+          `${v.key || tr('vm.edit.newSel', 'new constraint')}${v.value ? ' = ' + v.value : ''}` }),
+        newItem: () => ({ key: 'kubernetes.io/hostname' }),
+        args: [
+          { name: 'key', type: 'text', required: true,
+            suggest: ['kubernetes.io/hostname', 'topology.kubernetes.io/zone',
+                      'node-role.kubernetes.io/control-plane'],
+            label: { en: 'Node label', fr: 'Label de node' },
+            description: { en: 'The VM only schedules on nodes carrying this label',
+                           fr: 'La VM ne se place que sur les nodes portant ce label' } },
+          { name: 'value', type: 'text',
+            label: { en: 'Value', fr: 'Valeur' },
+            description: { en: 'e.g. the node hostname', fr: 'ex. le nom d’hôte du node' } },
+        ],
+      },
+    },
+  };
+
+  const AFFINITY_SCHEMA = {
+    id: 'vm-affinity',
+    nested: {
+      rule: {
+        min: 0, max: 10,
+        label: { en: 'VM placement rules', fr: 'Règles de placement VM' },
+        itemTitle: (v) => ({ icon: v.kind === 'attract' ? 'magnet' : 'construction', text:
+          `${v.kind === 'attract' ? tr('vm.edit.affNear', 'near') : tr('vm.edit.affAway', 'away from')} `
+          + `${v.key || 'tag'}=${v.value || '?'}${v.hard ? ' (strict)' : ''}` }),
+        newItem: () => ({ kind: 'avoid', key: 'app' }),
+        args: [
+          { name: 'kind', type: 'enum', default: 'avoid', enum_values: ['avoid', 'attract'],
+            label: { en: 'Rule', fr: 'Règle' },
+            description: { en: 'avoid = do not co-locate (HA pairs) · attract = co-locate (latency)',
+                           fr: 'avoid = ne pas co-localiser (paires HA) · attract = co-localiser (latence)' } },
+          { name: 'key', type: 'text', required: true,
+            suggest: ['app', 'purpose', 'case'],
+            label: { en: 'Tag key', fr: 'Clé du tag' },
+            description: { en: 'Matches other VMs carrying tag.harvesterhci.io/<key>',
+                           fr: 'Vise les autres VMs portant tag.harvesterhci.io/<clé>' } },
+          { name: 'value', type: 'text', required: true,
+            label: { en: 'Tag value', fr: 'Valeur du tag' },
+            description: { en: 'The value those VMs carry', fr: 'La valeur que portent ces VMs' } },
+          { name: 'hard', type: 'bool', default: false,
+            label: { en: 'Strict', fr: 'Stricte' },
+            description: { en: 'Strict = the VM stays unschedulable if the rule cannot be met; otherwise it is only a preference',
+                           fr: 'Stricte = la VM reste non planifiable si la règle ne peut pas être respectée ; sinon simple préférence' } },
+        ],
+      },
+    },
+  };
+
+  // v1.15.0, passthrough PCI/GPU. Vérifié de bout en bout le 22/09/2026 sur
+  // le banc harvlab (IOMMU virtuel, cartes émulées) : une carte e1000e et une
+  // fonction virtuelle SR-IOV d'une igb, choisies ici, sont arrivées sur le
+  // bus PCI de l'invité. Toujours pas de vrai GPU pour l'essayer.
+  const HOSTDEV_SCHEMA = {
+    id: 'vm-hostdevices',
+    nested: {
+      dev: {
+        min: 0, max: 8,
+        label: { en: 'Passthrough devices', fr: 'Périphériques en passthrough' },
+        itemTitle: (v) => ({ icon: v.kind === 'gpu' ? 'gamepad' : 'plug', text:
+          `${v.name || tr('vm.edit.newDev', 'new device')}`
+          + `${v.device_name ? ' — ' + v.device_name : ''}` }),
+        newItem: (items) => ({ kind: 'host', name: nextFree('dev-', 1, items.map(i => i.name)) }),
+        args: [
+          { name: 'name', type: 'text', required: true, validate: K8S_NAME_RE,
+            label: { en: 'Name', fr: 'Nom' },
+            description: { en: 'Free name used inside the VM spec',
+                           fr: 'Nom libre utilisé dans la spec de la VM' } },
+          { name: 'kind', type: 'enum', default: 'host', enum_values: ['host', 'gpu'],
+            label: { en: 'Kind', fr: 'Type' },
+            description: { en: 'gpu = declared under devices.gpus (vGPU/GPU), host = devices.hostDevices',
+                           fr: 'gpu = déclaré sous devices.gpus (vGPU/GPU), host = devices.hostDevices' } },
+          // v1.68.0 : PCI et USB (Advanced > PCI Devices / USB Devices pour
+          // activer le passthrough)
+          { name: 'device_name', type: 'ref', ref_endpoint: '/api/hostdevices',
+            ref_value_field: 'device_name', ref_label_field: 'display_name',
+            label: { en: 'Device (PCI or USB)', fr: 'Périphérique (PCI ou USB)' },
+            description: { en: 'Enable its passthrough first in Advanced > PCI Devices or USB Devices',
+                           fr: 'Activer d’abord son passthrough dans Avancé > Périphériques PCI ou USB' } },
+        ],
+      },
+    },
+  };
+
+  const TOLERATION_SCHEMA = {
+    id: 'vm-tolerations',
+    nested: {
+      tol: {
+        min: 0, max: 10,
+        label: { en: 'Tolerations', fr: 'Tolérances' },
+        itemTitle: (v) => ({ icon: 'shield', text:
+          `${v.key || tr('vm.edit.newTol', 'new toleration')}`
+          + `${v.value ? '=' + v.value : ''}${v.effect ? ' · ' + v.effect : ''}` }),
+        newItem: () => ({ operator: 'Equal', effect: 'NoSchedule' }),
+        args: [
+          { name: 'key', type: 'text',
+            suggest: ['node-role.kubernetes.io/control-plane', 'kubevirt.io/drain'],
+            label: { en: 'Taint key', fr: 'Clé du taint' },
+            description: { en: 'Empty with operator Exists = tolerate every taint',
+                           fr: 'Vide avec l’opérateur Exists = tolère tous les taints' } },
+          { name: 'operator', type: 'enum', default: 'Equal', enum_values: ['Equal', 'Exists'],
+            label: { en: 'Operator', fr: 'Opérateur' },
+            description: { en: 'Exists ignores the value', fr: 'Exists ignore la valeur' } },
+          { name: 'value', type: 'text',
+            label: { en: 'Value', fr: 'Valeur' },
+            description: { en: 'Only with the Equal operator', fr: 'Uniquement avec l’opérateur Equal' } },
+          { name: 'effect', type: 'enum', default: 'NoSchedule',
+            enum_values: ['NoSchedule', 'PreferNoSchedule', 'NoExecute'],
+            label: { en: 'Effect', fr: 'Effet' },
+            description: { en: 'Empty = tolerate every effect for that key',
+                           fr: 'Vide = tolère tous les effets pour cette clé' } },
+        ],
+      },
+    },
+  };
+
+  const NET_SCHEMA = {
+    id: 'vm-networks',
+    nested: {
+      nic: {
+        min: 0, max: 8,
+        label: { en: 'Network interfaces', fr: 'Interfaces réseau' },
+        itemTitle: (v) => ({ icon: 'plug', text:
+          `${v.name || tr('vm.edit.newNic', 'new interface')}`
+          + `${v.type ? ' — ' + v.type : ''}${v.network ? ' · ' + v.network : ''}`
+          + `${v.boot_order > 0 ? ' · boot #' + v.boot_order : ''}` }),
+        newItem: (items) => ({ name: nextFree('nic-', 1, items.map(i => i.name)) }),
+        args: [
+          { name: 'name', type: 'text', required: true, validate: K8S_NAME_RE,
+            label: { en: 'Name', fr: 'Nom' },
+            description: { en: 'Joins the network and the guest interface',
+                           fr: 'Relie le réseau à l’interface invité' } },
+          { name: 'type', type: 'enum', default: 'bridge',
+            enum_values: ['bridge', 'masquerade', 'macvtap', 'sriov'],
+            label: { en: 'Binding', fr: 'Attachement' },
+            description: { en: 'bridge = L2 on a VLAN network (Harvester default) · masquerade = NAT on the pod network · macvtap/sriov = direct attachment, needs a matching network and hardware (NOT verified on this cluster). On Harvester, SR-IOV goes through a virtual function passed through as a PCI device (Firmware section), verified on a test cluster.',
+                           fr: 'bridge = L2 sur un réseau VLAN (défaut Harvester) · masquerade = NAT sur le réseau des pods · macvtap/sriov = rattachement direct, exige un réseau et du matériel adaptés (NON vérifié sur ce cluster). Sur Harvester, le SR-IOV passe par une fonction virtuelle en passthrough PCI (section Firmware), vérifié sur un cluster de test.' } },
+          { name: 'network', type: 'ref', ref_endpoint: '/api/networks', ref_namespaced: true,
+            label: { en: 'Network (multus)', fr: 'Réseau (multus)' },
+            description: { en: 'NetworkAttachmentDefinition — bridge mode only',
+                           fr: 'NetworkAttachmentDefinition — mode bridge uniquement' } },
+          { name: 'model', type: 'enum', default: 'virtio',
+            enum_values: ['virtio', 'e1000', 'e1000e', 'rtl8139'],
+            label: { en: 'Model', fr: 'Modèle' },
+            description: { en: 'virtio needs guest drivers; e1000 for legacy guests',
+                           fr: 'virtio requiert des pilotes invité ; e1000 pour les invités anciens' } },
+          { name: 'boot_order', type: 'int', default: 0, min: 0, max: 64,
+            label: { en: 'Boot order', fr: 'Ordre de boot' },
+            description: { en: '0 = not bootable. Set 1 to PXE-boot from this NIC (shares the numbering with the disks)',
+                           fr: '0 = pas de boot. Mettre 1 pour démarrer en PXE sur cette carte (numérotation partagée avec les disques)' } },
+          { name: 'mac', type: 'text', validate: MAC_RE,
+            label: { en: 'MAC address', fr: 'Adresse MAC' },
+            description: { en: 'Empty = auto-generated. Changing it may break DHCP leases',
+                           fr: 'Vide = auto-générée. La changer peut casser les baux DHCP' } },
+          // v1.62.0 : l'IP statique de Harvester 1.9 (annotation de la VM
+          // static-ip.harvesterhci.io/<carte>, cartes en pont)
+          // vu sur harv1 : sur un réseau overlay, le webhook de Harvester en
+          // fait l'adresse kube-ovn de la carte (et le DHCP de kube-ovn la
+          // donne à l'invité) ; sur un VLAN, rien ne l'applique
+          { name: 'static_ip', type: 'text', validate: /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/,
+            label: { en: 'Static IP', fr: 'IP statique', de: 'Statische IP', es: 'IP estática', it: 'IP statico' },
+            description: { en: 'On an overlay (kube-ovn) network, kube-ovn gives this address to the interface (DHCP to the guest when the subnet has it). On a VLAN network it is only shown: set it in the guest (cloud-init network-data)',
+                           fr: 'Sur un réseau overlay (kube-ovn), kube-ovn donne cette adresse à la carte (par DHCP à l\'invité si le sous-réseau l\'a). Sur un réseau VLAN elle est seulement montrée : la configurer dans l\'invité (network-data du cloud-init)',
+                           de: 'In einem Overlay-Netz (kube-ovn) vergibt kube-ovn diese Adresse an die Karte (per DHCP an den Gast, wenn das Subnetz es hat). In einem VLAN wird sie nur angezeigt: im Gast setzen (cloud-init network-data)',
+                           es: 'En una red overlay (kube-ovn), kube-ovn da esta dirección a la tarjeta (por DHCP al invitado si la subred lo tiene). En una red VLAN solo se muestra: configurarla en el invitado (network-data de cloud-init)',
+                           it: 'Su una rete overlay (kube-ovn), kube-ovn assegna questo indirizzo alla scheda (via DHCP al guest se la subnet lo ha). Su una rete VLAN è solo mostrato: configurarlo nel guest (network-data di cloud-init)' } },
+        ],
+      },
+    },
+  };
+
+  // =========================================================================
+  // Cloud-init assistant (v1.8.1) — a one-way GENERATOR: the forms below
+  // produce cloud-config / network-data v1 YAML into the expert textareas
+  // (which stay the saved truth). We deliberately do not parse existing
+  // YAML back into the form — that would need a full YAML parser and
+  // would lie about arbitrary user content.
+  // =========================================================================
+  const CI_USER_SCHEMA = {
+    id: 'ci-userdata',
+    sections: [
+      { id: 'identity', label: { en: 'Identity & access', fr: 'Identité & accès' },
+        args: ['hostname', 'fqdn', 'timezone', 'locale', 'keyboard',
+               'ssh_pwauth', 'disable_root', 'expire_passwords'] },
+      { id: 'users', label: { en: 'Users', fr: 'Utilisateurs' }, nested: 'user' },
+      { id: 'packages', label: { en: 'Packages', fr: 'Paquets' },
+        args: ['package_update', 'package_upgrade', 'package_reboot', 'packages'] },
+      { id: 'storage', label: { en: 'Storage', fr: 'Stockage' },
+        args: ['growpart'] },
+      { id: 'fs', label: { en: 'Extra disks', fr: 'Disques additionnels' }, nested: 'fs' },
+      { id: 'files', label: { en: 'Files', fr: 'Fichiers' }, nested: 'file' },
+      { id: 'misc', label: { en: 'System', fr: 'Système' },
+        args: ['ntp_servers', 'ca_certs', 'bootcmd', 'runcmd'] },
+    ],
+    args: [
+      { name: 'hostname', type: 'text',
+        label: { en: 'Hostname', fr: 'Nom d’hôte' },
+        description: { en: 'Sets the guest hostname at first boot',
+                       fr: 'Définit le nom d’hôte de l’invité au premier boot' } },
+      { name: 'fqdn', type: 'text',
+        label: { en: 'FQDN', fr: 'FQDN' },
+        description: { en: 'e.g. vm1.home.lo (also sets manage_etc_hosts)',
+                       fr: 'ex. vm1.home.lo (active aussi manage_etc_hosts)' } },
+      { name: 'timezone', type: 'text',
+        suggest: ['Europe/Paris', 'Europe/Berlin', 'Europe/London', 'UTC', 'America/New_York', 'Asia/Tokyo'],
+        label: { en: 'Timezone', fr: 'Fuseau horaire' },
+        description: { en: 'e.g. Europe/Paris', fr: 'ex. Europe/Paris' } },
+      { name: 'locale', type: 'text',
+        suggest: ['fr_FR.UTF-8', 'en_US.UTF-8', 'de_DE.UTF-8', 'C.UTF-8'],
+        label: { en: 'Locale', fr: 'Locale' },
+        description: { en: 'e.g. fr_FR.UTF-8', fr: 'ex. fr_FR.UTF-8' } },
+      { name: 'keyboard', type: 'text',
+        suggest: ['fr', 'us', 'de', 'gb', 'es', 'it'],
+        label: { en: 'Keyboard layout', fr: 'Disposition clavier' },
+        description: { en: 'e.g. fr, us, de', fr: 'ex. fr, us, de' } },
+      { name: 'ssh_pwauth', type: 'bool', default: false,
+        label: { en: 'Allow SSH password auth', fr: 'Autoriser SSH par mot de passe' },
+        description: { en: 'Required for password logins over SSH',
+                       fr: 'Requis pour se connecter en SSH par mot de passe' } },
+      { name: 'disable_root', type: 'bool', default: true,
+        label: { en: 'Disable root login', fr: 'Désactiver le login root' },
+        description: { en: 'cloud-init default is true', fr: 'true par défaut côté cloud-init' } },
+      { name: 'expire_passwords', type: 'bool', default: false,
+        label: { en: 'Expire passwords at first login', fr: 'Expirer les mots de passe au premier login' },
+        description: { en: 'Forces every user to change their password',
+                       fr: 'Force chaque utilisateur à changer son mot de passe' } },
+      { name: 'package_update', type: 'bool', default: false,
+        label: { en: 'Refresh package index', fr: 'Rafraîchir l’index des paquets' },
+        description: { en: 'apt/zypper/dnf refresh at first boot',
+                       fr: 'refresh apt/zypper/dnf au premier boot' } },
+      { name: 'package_upgrade', type: 'bool', default: false,
+        label: { en: 'Upgrade packages', fr: 'Mettre à jour les paquets' },
+        description: { en: 'Full package upgrade at first boot (slower)',
+                       fr: 'Mise à jour complète au premier boot (plus lent)' } },
+      { name: 'package_reboot', type: 'bool', default: false,
+        label: { en: 'Reboot if required', fr: 'Redémarrer si nécessaire' },
+        description: { en: 'package_reboot_if_required after upgrades',
+                       fr: 'package_reboot_if_required après mise à jour' } },
+      { name: 'packages', type: 'textarea', rows: 3,
+        label: { en: 'Packages (one per line)', fr: 'Paquets (un par ligne)' },
+        description: { en: 'Installed at first boot', fr: 'Installés au premier boot' } },
+      { name: 'growpart', type: 'bool', default: true,
+        label: { en: 'Grow root partition', fr: 'Étendre la partition racine' },
+        description: { en: 'Expand / to fill the (resized) root disk',
+                       fr: 'Étend / pour occuper le disque racine (redimensionné)' } },
+      { name: 'ntp_servers', type: 'text',
+        suggest: ['pool.ntp.org', '0.pool.ntp.org, 1.pool.ntp.org', 'time.cloudflare.com'],
+        label: { en: 'NTP servers (comma-separated)', fr: 'Serveurs NTP (séparés par des virgules)' },
+        description: { en: 'Enables the ntp module', fr: 'Active le module ntp' } },
+      { name: 'ca_certs', type: 'textarea', rows: 3,
+        label: { en: 'Trusted CA certificates (PEM)', fr: 'Certificats CA de confiance (PEM)' },
+        description: { en: 'Added to the guest trust store (e.g. your internal CA)',
+                       fr: 'Ajoutés au magasin de confiance de l’invité (ex. votre CA interne)' } },
+      { name: 'bootcmd', type: 'textarea', rows: 2,
+        label: { en: 'Early boot commands (one per line)', fr: 'Commandes de début de boot (une par ligne)' },
+        description: { en: 'Run very early, on every boot',
+                       fr: 'Exécutées très tôt, à chaque boot' } },
+      { name: 'runcmd', type: 'textarea', rows: 3,
+        label: { en: 'Commands (one per line)', fr: 'Commandes (une par ligne)' },
+        description: { en: 'Shell commands run once at the end of first boot',
+                       fr: 'Commandes shell exécutées une fois en fin de premier boot' } },
+    ],
+    nested: {
+      user: {
+        min: 0, max: 8,
+        label: { en: 'Users', fr: 'Utilisateurs' },
+        itemTitle: (v) => ({ icon: 'user', text:
+          `${v.name || tr('vm.edit.ci.newUser', 'new user')}${v.sudo ? ' · sudo' : ''}` }),
+        args: [
+          { name: 'name', type: 'text', required: true, validate: K8S_NAME_RE,
+            label: { en: 'Username', fr: 'Nom d’utilisateur' },
+            description: { en: 'The account to create', fr: 'Le compte à créer' } },
+          { name: 'password', type: 'text',
+            label: { en: 'Password', fr: 'Mot de passe' },
+            description: { en: 'Stored as plain text in the cloud-init Secret — prefer SSH keys',
+                           fr: 'Stocké en clair dans le Secret cloud-init — préférez les clés SSH' } },
+          { name: 'sudo', type: 'bool', default: true,
+            label: { en: 'Passwordless sudo', fr: 'sudo sans mot de passe' },
+            description: { en: 'ALL=(ALL) NOPASSWD:ALL', fr: 'ALL=(ALL) NOPASSWD:ALL' } },
+          { name: 'groups', type: 'text',
+            suggest: ['wheel', 'sudo', 'docker', 'wheel, docker'],
+            label: { en: 'Groups (comma-separated)', fr: 'Groupes (séparés par des virgules)' },
+            description: { en: 'e.g. wheel, docker', fr: 'ex. wheel, docker' } },
+          { name: 'shell', type: 'text', default: '/bin/bash',
+            suggest: ['/bin/bash', '/bin/sh', '/usr/bin/zsh', '/usr/bin/fish'],
+            label: { en: 'Shell', fr: 'Shell' },
+            description: { en: 'Login shell', fr: 'Shell de connexion' } },
+          { name: 'ssh_key', type: 'ref', ref_endpoint: '/api/sshkeys',
+            ref_value_field: 'public_key', ref_label_field: 'name',
+            label: { en: 'SSH key (Harvester)', fr: 'Clé SSH (Harvester)' },
+            description: { en: 'A KeyPair stored in Harvester', fr: 'Un KeyPair stocké dans Harvester' } },
+          { name: 'ssh_key_extra', type: 'textarea', rows: 2,
+            label: { en: 'Extra public keys (one per line)', fr: 'Clés publiques en plus (une par ligne)' },
+            description: { en: 'Raw ssh-ed25519/ssh-rsa lines', fr: 'Lignes ssh-ed25519/ssh-rsa brutes' } },
+        ],
+      },
+      fs: {
+        min: 0, max: 8,
+        label: { en: 'Extra disks (format & mount)', fr: 'Disques additionnels (formater & monter)' },
+        itemTitle: (v) => ({ icon: 'storage', text:
+          `${v.device || '/dev/vdb'} -> ${v.mount_point || '?'}${v.filesystem ? ' (' + v.filesystem + ')' : ''}` }),
+        newItem: (items) => ({ device: nextFreeDev(items.map(i => i.device)) }),
+        args: [
+          { name: 'device', type: 'text', required: true, default: '/dev/vdb',
+            suggest: ['/dev/vdb', '/dev/vdc', '/dev/vdd', '/dev/sdb', '/dev/sdc'],
+            label: { en: 'Device', fr: 'Périphérique' },
+            description: { en: 'First extra virtio disk is /dev/vdb, then /dev/vdc…',
+                           fr: 'Premier disque virtio additionnel : /dev/vdb, puis /dev/vdc…' } },
+          { name: 'filesystem', type: 'enum', default: 'ext4', enum_values: ['ext4', 'xfs', 'btrfs'],
+            label: { en: 'Filesystem', fr: 'Système de fichiers' },
+            description: { en: 'Created at first boot (existing data untouched: overwrite=false)',
+                           fr: 'Créé au premier boot (données existantes préservées : overwrite=false)' } },
+          { name: 'mount_point', type: 'text', required: true,
+            suggest: ['/data', '/srv', '/var/lib/data', '/mnt/data'],
+            label: { en: 'Mount point', fr: 'Point de montage' },
+            description: { en: 'e.g. /data', fr: 'ex. /data' } },
+        ],
+      },
+      file: {
+        min: 0, max: 8,
+        label: { en: 'Files (write_files)', fr: 'Fichiers (write_files)' },
+        itemTitle: (v) => ({ icon: 'doc', text:
+          `${v.path || tr('vm.edit.ci.newFile', 'new file')}` }),
+        args: [
+          { name: 'path', type: 'text', required: true,
+            label: { en: 'Path', fr: 'Chemin' },
+            description: { en: 'Absolute path in the guest', fr: 'Chemin absolu dans l’invité' } },
+          { name: 'permissions', type: 'text', default: '0644', validate: /^0[0-7]{3}$/,
+            suggest: ['0644', '0755', '0600', '0400', '0700'],
+            label: { en: 'Permissions', fr: 'Permissions' },
+            description: { en: 'Octal, e.g. 0644 / 0755', fr: 'Octal, ex. 0644 / 0755' } },
+          { name: 'content', type: 'textarea', rows: 4,
+            label: { en: 'Content', fr: 'Contenu' },
+            description: { en: 'Written verbatim', fr: 'Écrit tel quel' } },
+        ],
+      },
+    },
+  };
+
+  const CI_NET_SCHEMA = {
+    id: 'ci-netdata',
+    args: [
+      { name: 'dns', type: 'text',
+        label: { en: 'DNS servers (comma-separated)', fr: 'Serveurs DNS (séparés par des virgules)' },
+        description: { en: 'Global resolvers (type: nameserver)', fr: 'Résolveurs globaux (type: nameserver)' } },
+      { name: 'search', type: 'text',
+        label: { en: 'Search domains (comma-separated)', fr: 'Domaines de recherche (séparés par des virgules)' },
+        description: { en: 'e.g. home.lo', fr: 'ex. home.lo' } },
+    ],
+    nested: {
+      nic: {
+        min: 0, max: 4,
+        label: { en: 'Interfaces', fr: 'Interfaces' },
+        itemTitle: (v) => ({ icon: 'plug', text:
+          `${v.iface || 'eth0'} — ${v.mode || 'dhcp'}${v.address ? ' · ' + v.address : ''}` }),
+        newItem: (items) => ({ iface: nextFree('eth', 0, items.map(i => i.iface)) }),
+        args: [
+          { name: 'iface', type: 'text', required: true, default: 'eth0',
+            suggest: ['eth0', 'eth1', 'ens3', 'ens4', 'enp1s0'],
+            label: { en: 'Interface name', fr: 'Nom d’interface' },
+            description: { en: 'As seen by the guest (eth0, ens3…)',
+                           fr: 'Vu par l’invité (eth0, ens3…)' } },
+          { name: 'mode', type: 'enum', default: 'dhcp', enum_values: ['dhcp', 'static'],
+            label: { en: 'Addressing', fr: 'Adressage' },
+            description: { en: 'dhcp or static', fr: 'dhcp ou statique' } },
+          { name: 'address', type: 'text', validate: /^[0-9.]+\/[0-9]+$/,
+            label: { en: 'Address (CIDR)', fr: 'Adresse (CIDR)' },
+            description: { en: 'e.g. 172.16.3.50/16', fr: 'ex. 172.16.3.50/16' } },
+          { name: 'gateway', type: 'text', validate: /^[0-9.]+$/,
+            label: { en: 'Gateway', fr: 'Passerelle' },
+            description: { en: 'e.g. 172.16.0.1', fr: 'ex. 172.16.0.1' } },
+          { name: 'mtu', type: 'int', min: 576, max: 9216,
+            label: { en: 'MTU', fr: 'MTU' },
+            description: { en: 'Empty = default (1500)', fr: 'Vide = défaut (1500)' } },
+        ],
+      },
+    },
+  };
+
+  /** Minimal YAML string quoting for the narrow structures WE generate. */
+  function yamlStr(s) {
+    s = String(s);
+    if (/^[A-Za-z0-9._\/-]+$/.test(s)) return s;
+    return "'" + s.replace(/'/g, "''") + "'";
+  }
+
+  /** Emit a YAML literal block (|) with the given indentation. */
+  function yamlBlock(text, indent) {
+    const pad = ' '.repeat(indent);
+    return '|\n' + String(text).replace(/\s+$/, '').split('\n')
+      .map(l => pad + l).join('\n');
+  }
+
+  function linesOf(text) {
+    return String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  }
+
+  function csvOf(text) {
+    return String(text || '').split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  function genUserData(spec) {
+    const L = ['#cloud-config'];
+    if (spec.hostname) L.push(`hostname: ${yamlStr(spec.hostname)}`);
+    if (spec.fqdn) {
+      L.push(`fqdn: ${yamlStr(spec.fqdn)}`);
+      L.push('manage_etc_hosts: true');
+    }
+    if (spec.timezone) L.push(`timezone: ${yamlStr(spec.timezone)}`);
+    if (spec.locale) L.push(`locale: ${yamlStr(spec.locale)}`);
+    if (spec.keyboard) {
+      L.push('keyboard:');
+      L.push(`  layout: ${yamlStr(spec.keyboard)}`);
+    }
+    if (spec.ssh_pwauth) L.push('ssh_pwauth: true');
+    if (spec.disable_root === false) L.push('disable_root: false');
+    if (spec.expire_passwords) {
+      L.push('chpasswd:');
+      L.push('  expire: true');
+    }
+    if (spec.package_update) L.push('package_update: true');
+    if (spec.package_upgrade) L.push('package_upgrade: true');
+    if (spec.package_reboot) L.push('package_reboot_if_required: true');
+    if (spec.growpart === false) {
+      L.push('growpart:');
+      L.push('  mode: off');
+    }
+    const users = spec.user || [];
+    if (users.length) {
+      L.push('users:');
+      users.forEach(u => {
+        L.push(`  - name: ${yamlStr(u.name || '')}`);
+        L.push(`    shell: ${yamlStr(u.shell || '/bin/bash')}`);
+        if (u.sudo) L.push(`    sudo: ${yamlStr('ALL=(ALL) NOPASSWD:ALL')}`);
+        const groups = csvOf(u.groups);
+        if (groups.length) L.push(`    groups: ${yamlStr(groups.join(', '))}`);
+        if (u.password) {
+          L.push(`    plain_text_passwd: ${yamlStr(u.password)}`);
+          L.push('    lock_passwd: false');
+        }
+        const keys = [];
+        if (u.ssh_key) keys.push(u.ssh_key);
+        keys.push(...linesOf(u.ssh_key_extra));
+        if (keys.length) {
+          L.push('    ssh_authorized_keys:');
+          keys.forEach(k => L.push(`      - ${yamlStr(k)}`));
+        }
+      });
+    }
+    const pkgs = linesOf(spec.packages);
+    if (pkgs.length) {
+      L.push('packages:');
+      pkgs.forEach(p => L.push(`  - ${yamlStr(p)}`));
+    }
+    const fsItems = spec.fs || [];
+    if (fsItems.length) {
+      L.push('fs_setup:');
+      fsItems.forEach(f => {
+        L.push(`  - device: ${yamlStr(f.device || '')}`);
+        L.push(`    filesystem: ${yamlStr(f.filesystem || 'ext4')}`);
+        L.push('    overwrite: false');
+      });
+      L.push('mounts:');
+      fsItems.forEach(f => {
+        L.push(`  - [${yamlStr(f.device || '')}, ${yamlStr(f.mount_point || '')}, ${yamlStr(f.filesystem || 'ext4')}, defaults, '0', '2']`);
+      });
+    }
+    const files = spec.file || [];
+    if (files.length) {
+      L.push('write_files:');
+      files.forEach(f => {
+        L.push(`  - path: ${yamlStr(f.path || '')}`);
+        L.push(`    permissions: '${(f.permissions || '0644').replace(/'/g, '')}'`);
+        L.push(`    content: ${yamlBlock(f.content || '', 6)}`);
+      });
+    }
+    const ntp = csvOf(spec.ntp_servers);
+    if (ntp.length) {
+      L.push('ntp:');
+      L.push('  enabled: true');
+      L.push('  servers:');
+      ntp.forEach(s2 => L.push(`    - ${yamlStr(s2)}`));
+    }
+    if (spec.ca_certs && String(spec.ca_certs).trim()) {
+      L.push('ca_certs:');
+      L.push('  trusted:');
+      L.push(`    - ${yamlBlock(spec.ca_certs, 6)}`);
+    }
+    const boots = linesOf(spec.bootcmd);
+    if (boots.length) {
+      L.push('bootcmd:');
+      boots.forEach(c => L.push(`  - ${yamlStr(c)}`));
+    }
+    const cmds = linesOf(spec.runcmd);
+    if (cmds.length) {
+      L.push('runcmd:');
+      cmds.forEach(c => L.push(`  - ${yamlStr(c)}`));
+    }
+    return L.join('\n') + '\n';
+  }
+
+  function genNetworkData(spec) {
+    const nics = (spec.nic && spec.nic.length)
+      ? spec.nic : [{ iface: 'eth0', mode: 'dhcp' }];
+    const L = ['version: 1', 'config:'];
+    nics.forEach(n => {
+      L.push('  - type: physical');
+      L.push(`    name: ${yamlStr(n.iface || 'eth0')}`);
+      if (n.mtu) L.push(`    mtu: ${n.mtu}`);
+      L.push('    subnets:');
+      if (n.mode === 'static') {
+        if (!n.address) throw new Error(tr('vm.edit.ci.errAddr', 'a CIDR address is required for static addressing') + ` (${n.iface || 'eth0'})`);
+        L.push('      - type: static');
+        L.push(`        address: ${yamlStr(n.address)}`);
+        if (n.gateway) L.push(`        gateway: ${yamlStr(n.gateway)}`);
+      } else {
+        L.push('      - type: dhcp');
+      }
+    });
+    const dns = csvOf(spec.dns);
+    const search = csvOf(spec.search);
+    if (dns.length || search.length) {
+      L.push('  - type: nameserver');
+      if (dns.length) {
+        L.push('    address:');
+        dns.forEach(d => L.push(`      - ${yamlStr(d)}`));
+      }
+      if (search.length) {
+        L.push('    search:');
+        search.forEach(d => L.push(`      - ${yamlStr(d)}`));
+      }
+    }
+    return L.join('\n') + '\n';
+  }
+
+  // =========================================================================
+  // Mappers — KubeVirt pairs of arrays <-> flat form items
+  // =========================================================================
+  const VCT_ANNOTATION = 'harvesterhci.io/volumeClaimTemplates';
+
+  /**
+   * @param opts.claimsAreToCreate  les PVC déclarés dans l'annotation
+   *   `volumeClaimTemplates` n'existent pas encore et doivent être créés.
+   *
+   * C'est vrai d'un TEMPLATE (son `pvc-rootdisk` est une recette, pas un
+   * volume), faux d'une VM en service. La distinction est capitale : sur une
+   * VM existante, présenter son disque comme « à créer depuis une image »
+   * ferait générer un PVC NEUF à la sauvegarde suivante, abandonnant
+   * l'ancien et son contenu. L'option est donc explicite, et l'éditeur ne
+   * l'active jamais.
+   */
+  function vmDisksToForm(vm, opts = {}) {
+    const template = ((vm.spec || {}).template || {}).spec || {};
+    const disks = ((template.domain || {}).devices || {}).disks || [];
+    const volumes = template.volumes || [];
+    const volByName = Object.fromEntries(volumes.map(v => [v.name, v]));
+    let vctByName = {};
+    try {
+      const raw = ((vm.metadata || {}).annotations || {})[VCT_ANNOTATION];
+      if (raw) {
+        const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        vctByName = Object.fromEntries(
+          (list || []).map(v => [(v.metadata || {}).name, v]));
+      }
+    } catch { vctByName = {}; }
+    const usedVols = new Set();
+    const items = [];
+    const passthrough = { disks: [], volumes: [] };
+
+    disks.forEach(d => {
+      const vol = volByName[d.name];
+      if (vol) usedVols.add(d.name);
+      const devKey = d.cdrom ? 'cdrom' : (d.disk ? 'disk' : null);
+      const editable = devKey && vol && vol.persistentVolumeClaim
+        && !vol.cloudInitNoCloud && !vol.cloudInitConfigDrive;
+      if (!editable) {
+        passthrough.disks.push(d);
+        if (vol) passthrough.volumes.push(vol);
+        return;
+      }
+      const claimName = vol.persistentVolumeClaim.claimName;
+      const recipe = opts.claimsAreToCreate ? (vctByName[claimName] || null) : null;
+      const imageId = recipe
+        && ((recipe.metadata || {}).annotations || {})['harvesterhci.io/imageId'];
+      items.push({
+        name: d.name,
+        device: devKey,
+        bus: (d[devKey] || {}).bus || 'virtio',
+        boot_order: d.bootOrder ?? 0,
+        // Un PVC à créer se présente pour ce qu'il est : une image ou un
+        // disque vierge, avec la taille et la classe que la recette porte.
+        source: recipe ? (imageId ? 'image' : 'blank') : 'pvc',
+        image: imageId || '',
+        size: recipe
+          ? (((recipe.spec || {}).resources || {}).requests || {}).storage || ''
+          : '',
+        storage_class: recipe ? ((recipe.spec || {}).storageClassName || '') : '',
+        pvc: recipe ? '' : `${vm.metadata.namespace}/${claimName}`,
+        // v1.13.0 : options fines par disque
+        serial: d.serial || '',
+        cache: d.cache || '',
+        shareable: !!d.shareable,
+        readonly: !!(d[devKey] || {}).readonly,
+        io_thread: !!d.dedicatedIOThread,
+      });
+    });
+    // Orphan volumes (no matching disk entry) ride along untouched.
+    volumes.forEach(v => { if (!usedVols.has(v.name)) passthrough.volumes.push(v); });
+    return { items, passthrough };
+  }
+
+  // v1.13.0 : bootOrder est une séquence GLOBALE partagée par les disques
+  // ET les cartes réseau (appris en vrai : le webhook Harvester répond
+  // « Boot order ... already set for a different device »). Chaque éditeur
+  // ne voit que sa moitié — on confronte donc l'autre moitié de la spec.
+  function bootOrdersTakenBy(vm, kind) {
+    const dev = ((((vm.spec || {}).template || {}).spec || {}).domain || {}).devices || {};
+    const src = kind === 'disks' ? (dev.disks || []) : (dev.interfaces || []);
+    const out = new Map();
+    src.forEach(d => { if (d.bootOrder > 0) out.set(d.bootOrder, d.name); });
+    return out;
+  }
+
+  function checkBootOrder(order, name, taken, otherLabel) {
+    if (!(order > 0)) return;
+    const clash = taken.get(order);
+    if (clash) {
+      throw new Error(tr('vm.edit.errBootDup',
+        'boot order already used by another device') + `: #${order} — ${otherLabel} "${clash}"`);
+    }
+    taken.set(order, name);
+  }
+
+  function formDisksToPatch(items, passthrough, vm) {
+    const ns = vm.metadata.namespace;
+    const seen = new Set(passthrough.disks.map(d => d.name));
+    let existingVCT = [];
+    try {
+      existingVCT = JSON.parse(((vm.metadata || {}).annotations || {})[VCT_ANNOTATION] || '[]');
+    } catch { existingVCT = []; }
+
+    const volumes = [...passthrough.volumes];
+    const disks = [...passthrough.disks];
+    const takenBoot = bootOrdersTakenBy(vm, 'interfaces');
+    passthrough.disks.forEach(d => { if (d.bootOrder > 0) takenBoot.set(d.bootOrder, d.name); });
+    const newVCT = [];
+    const keepClaims = new Set();
+
+    items.forEach(item => {
+      if (!item.name || !K8S_NAME_RE.test(item.name)) {
+        throw new Error(tr('vm.edit.errName', 'disk name must be a valid RFC 1123 label') + `: "${item.name || ''}"`);
+      }
+      if (seen.has(item.name)) {
+        throw new Error(tr('vm.edit.errDup', 'duplicate disk name') + `: ${item.name}`);
+      }
+      seen.add(item.name);
+      const d = { name: item.name };
+      checkBootOrder(item.boot_order, item.name, takenBoot,
+                     tr('vm.edit.devNic', 'interface'));
+      if (item.boot_order > 0) d.bootOrder = item.boot_order;
+      const devKey = item.device === 'cdrom' ? 'cdrom' : 'disk';
+      d[devKey] = { bus: item.bus || 'virtio' };
+      // v1.13.0 : options fines — omises quand elles valent le défaut,
+      // pour ne pas alourdir la spec ni figer des choix implicites.
+      if (item.readonly) d[devKey].readonly = true;
+      const serial = (item.serial || '').trim();
+      if (serial) {
+        if (!/^[A-Za-z0-9_.+-]{1,36}$/.test(serial)) {
+          throw new Error(tr('vm.edit.errSerial',
+            'disk serial: up to 36 chars, letters/digits/_.+- only') + `: ${item.name}`);
+        }
+        d.serial = serial;
+      }
+      if (item.cache) d.cache = item.cache;
+      if (item.shareable) d.shareable = true;
+      if (item.io_thread) d.dedicatedIOThread = true;
+      disks.push(d);
+
+      if (item.source === 'pvc' || !item.source) {
+        if (!item.pvc) throw new Error(tr('vm.edit.errPvc', 'select an existing PVC for disk') + ` ${item.name}`);
+        const slash = item.pvc.indexOf('/');
+        const pvcNs = slash > 0 ? item.pvc.slice(0, slash) : ns;
+        const claim = slash > 0 ? item.pvc.slice(slash + 1) : item.pvc;
+        if (pvcNs !== ns) {
+          throw new Error(tr('vm.edit.errPvcNs', 'the PVC must live in the VM namespace') + ` (${ns}): ${item.pvc}`);
+        }
+        keepClaims.add(claim);
+        volumes.push({ name: item.name, persistentVolumeClaim: { claimName: claim } });
+        return;
+      }
+
+      // NEW disk → PVC created by Harvester via the volumeClaimTemplates
+      // annotation (same mechanism as the Harvester UI).
+      if (!item.size) throw new Error(tr('vm.edit.errSize', 'a size is required for a new disk') + ` (${item.name})`);
+      const claim = `${vm.metadata.name}-${item.name}-${Math.random().toString(36).slice(2, 7)}`;
+      const t = {
+        metadata: { name: claim, annotations: {} },
+        spec: {
+          accessModes: ['ReadWriteMany'],
+          resources: { requests: { storage: item.size } },
+          volumeMode: 'Block',
+        },
+      };
+      if (item.source === 'image') {
+        if (!item.image) throw new Error(tr('vm.edit.errImage', 'select a VM image for disk') + ` ${item.name}`);
+        const imgName = item.image.split('/').pop();
+        t.metadata.annotations['harvesterhci.io/imageId'] = item.image;
+        // Lue sur l'image, jamais fabriquée (cf. imageStorageClass). Le
+        // repli sur l'ancienne convention ne sert qu'au cas où la liste
+        // n'aurait pas encore été chargée.
+        t.spec.storageClassName = imageStorageClass.get(item.image)
+          || `longhorn-${imgName}`;
+      } else if (item.storage_class) {
+        t.spec.storageClassName = item.storage_class;
+      }
+      newVCT.push(t);
+      keepClaims.add(claim);
+      volumes.push({ name: item.name, persistentVolumeClaim: { claimName: claim } });
+    });
+
+    // Keep annotation entries whose PVC is still referenced; drop the ones
+    // belonging to removed disks; append the new templates.
+    const finalVCT = existingVCT
+      .filter(t => t && t.metadata && keepClaims.has(t.metadata.name))
+      .concat(newVCT);
+
+    return {
+      metadata: { annotations: { [VCT_ANNOTATION]: JSON.stringify(finalVCT) } },
+      spec: { template: { spec: {
+        volumes,
+        domain: { devices: { disks } },
+      } } },
+    };
+  }
+
+  function vmNetsToForm(vm) {
+    const template = ((vm.spec || {}).template || {}).spec || {};
+    const interfaces = ((template.domain || {}).devices || {}).interfaces || [];
+    const networks = template.networks || [];
+    const netByName = Object.fromEntries(networks.map(n => [n.name, n]));
+    const used = new Set();
+    const items = [];
+    const passthrough = { interfaces: [], networks: [] };
+
+    interfaces.forEach(itf => {
+      const net = netByName[itf.name];
+      if (net) used.add(itf.name);
+      // vu sur harv1 : sur un réseau overlay dont le sous-réseau sert le DHCP,
+      // le webhook de Harvester 1.9 remplace `bridge` par le plugin KubeVirt
+      // `binding: managedtap`. C'est une carte en pont pour la personne ;
+      // réécrite en `bridge`, le webhook la reconvertit.
+      const type = (itf.bridge || (itf.binding && itf.binding.name === 'managedtap')) ? 'bridge'
+        : itf.masquerade ? 'masquerade'
+        : itf.macvtap ? 'macvtap'
+        : itf.sriov ? 'sriov' : null;
+      if (!type || !net) {           // sriov / slirp / broken pair → untouched
+        passthrough.interfaces.push(itf);
+        if (net) passthrough.networks.push(net);
+        return;
+      }
+      items.push({
+        name: itf.name,
+        type,
+        network: net.multus ? net.multus.networkName : '',
+        model: itf.model || 'virtio',
+        mac: itf.macAddress || '',
+        static_ip: ((vm.metadata || {}).annotations || {})[`static-ip.harvesterhci.io/${itf.name}`] || '',
+        // v1.13.0 : ordre de boot réseau (PXE)
+        boot_order: itf.bootOrder ?? 0,
+      });
+    });
+    networks.forEach(n => { if (!used.has(n.name)) passthrough.networks.push(n); });
+    return { items, passthrough };
+  }
+
+  function formNetsToPatch(items, passthrough, vm) {
+    const seen = new Set(passthrough.interfaces.map(i => i.name));
+    const interfaces = [...passthrough.interfaces];
+    const takenBoot = bootOrdersTakenBy(vm, 'disks');
+    passthrough.interfaces.forEach(i => { if (i.bootOrder > 0) takenBoot.set(i.bootOrder, i.name); });
+    const networks = [...passthrough.networks];
+
+    items.forEach(item => {
+      if (!item.name || !K8S_NAME_RE.test(item.name)) {
+        throw new Error(tr('vm.edit.errNicName', 'interface name must be a valid RFC 1123 label') + `: "${item.name || ''}"`);
+      }
+      if (seen.has(item.name)) {
+        throw new Error(tr('vm.edit.errNicDup', 'duplicate interface name') + `: ${item.name}`);
+      }
+      seen.add(item.name);
+      if (item.mac && !MAC_RE.test(item.mac)) {
+        throw new Error(tr('vm.edit.errMac', 'invalid MAC address') + `: ${item.mac}`);
+      }
+      const itf = { name: item.name };
+      checkBootOrder(item.boot_order, item.name, takenBoot,
+                     tr('vm.edit.devDisk', 'disk'));
+      if (item.model) itf.model = item.model;
+      if (item.mac) itf.macAddress = item.mac;
+      // bootOrder partage la MÊME séquence que les disques : une VM qui
+      // doit démarrer en PXE met son NIC à 1 et repousse le disque.
+      if (item.boot_order > 0) itf.bootOrder = item.boot_order;
+      const net = { name: item.name };
+      if (item.type === 'masquerade') {
+        itf.masquerade = {};
+        net.pod = {};
+      } else {
+        if (!item.network) {
+          throw new Error(tr('vm.edit.errNet', 'a multus network is required for a bridge interface') + ` (${item.name})`);
+        }
+        // macvtap / sriov : même appairage réseau multus, binding différent.
+        // ⚠️ non vérifié en réel (pas de carte SR-IOV sur harv1).
+        itf[item.type === 'macvtap' ? 'macvtap'
+            : item.type === 'sriov' ? 'sriov' : 'bridge'] = {};
+        net.multus = { networkName: item.network };
+      }
+      interfaces.push(itf);
+      networks.push(net);
+    });
+
+    return { spec: { template: { spec: {
+      networks,
+      domain: { devices: { interfaces } },
+    } } } };
+  }
+
+  // =========================================================================
+  // Panel lifecycle
+  // =========================================================================
+  async function open(cluster, namespace, name) {
+    const panelId = `vm-edit-${cluster}-${namespace}-${name}`;
+    const existing = document.getElementById('fp-' + panelId);
+    const title = `${tr('vm.edit.title', 'Edit')} — ${namespace}/${name}`;
+    if (existing) {
+      // Already open: FloatingPanels restores/focuses it. Re-running the
+      // setup below would stack duplicate nav listeners (v1.6.x bug).
+      return FloatingPanels.open({ id: panelId, title, icon: 'settings',
+        headerActions: consoleAction(cluster, namespace, name) });
+    }
+    const html = `
+      <div class="vm-edit-layout">
+        <aside class="vm-edit-nav">
+          ${SECTIONS.map(s => `
+            <button data-section="${s.id}">
+              <span class="ic">${Icons.svg(s.icon, { size: 14 })}</span>
+              <span>${esc(s.label())}</span>
+            </button>`).join('')}
+        </aside>
+        <main class="vm-edit-content">
+          <div class="vm-edit-loading">${esc(tr('vm.edit.loading', 'Loading VM spec…'))}</div>
+        </main>
+      </div>`;
+
+    const panel = FloatingPanels.open({
+      id: panelId,
+      title,
+      icon: 'settings',
+      bodyHtml: html,
+      width: 980,
+      height: 640,
+      restoreSpec: { type: 'vm-edit', args: { cluster, namespace, name } },
+      headerActions: consoleAction(cluster, namespace, name),
+      onClose: () => refreshers.delete(panelId),
+    });
+
+    let activeSection = 'general';
+    let vmSpec = null;
+    const navBtns = panel.el.querySelectorAll('.vm-edit-nav button');
+    const setActive = (id) => {
+      activeSection = id;
+      navBtns.forEach(b => b.classList.toggle('active', b.dataset.section === id));
+      renderSection();
+    };
+    navBtns.forEach(b => b.addEventListener('click', () => setActive(b.dataset.section)));
+    navBtns[0].classList.add('active');
+
+    const renderSection = () => {
+      const content = panel.el.querySelector('.vm-edit-content');
+      if (!vmSpec) { content.innerHTML = '<div class="vm-edit-loading">Loading…</div>'; return; }
+      content.innerHTML = '';
+      const sectionEl = document.createElement('section');
+      sectionEl.className = 'vm-edit-section active';
+      sectionEl.dataset.section = activeSection;
+      sectionEl.innerHTML = renderSectionHtml(activeSection, vmSpec, cluster);
+      content.appendChild(sectionEl);
+      wireSection(sectionEl, activeSection, cluster, namespace, name, () => vmSpec);
+    };
+
+    const refresh = async () => {
+      try {
+        vmSpec = await fetch(`/api/vm/${enc(cluster)}/${enc(namespace)}/${enc(name)}`).then(r => {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        });
+        renderSection();
+      } catch (e) {
+        panel.el.querySelector('.vm-edit-content').innerHTML =
+          `<div class="vm-edit-section active"><div class="summary-bar bad">${Icons.svg('fail', { size: 14 })} ${esc(e.message)}</div></div>`;
+      }
+    };
+    refreshers.set(panelId, refresh);
+    await refresh();
+    return panel;
+  }
+
+  // =========================================================================
+  // Section renderers
+  // =========================================================================
+  // v1.13.0 : raccourci vers la console dans le bandeau du panneau Edit
+  // (symétrique du bouton ⚙ que la console offre déjà vers l'éditeur).
+  // ⚠️ le global est VMConsole (casse déjà payée en 1.7.1).
+  function consoleAction(cluster, namespace, name) {
+    return [{
+      label: Icons.svg('console'),
+      tip: tr('vm.edit.openConsole', 'Open the VNC console for this VM'),
+      onClick: () => window.VMConsole && window.VMConsole.open(cluster, namespace, name),
+    }];
+  }
+
+  function renderSectionHtml(id, vm, cluster, opts = {}) {
+    const spec     = vm.spec || {};
+    const template = (spec.template || {}).spec || {};
+    const domain   = template.domain || {};
+    const annot    = (vm.metadata?.annotations) || {};
+
+    switch (id) {
+      case 'general': return renderGeneral(vm, spec, annot, cluster);
+      case 'compute': return renderCompute(domain, vm);
+      case 'firmware': return renderFirmware(domain, cluster);
+      case 'placement': return renderPlacement(vm, template, cluster);
+      case 'lifecycle': return renderLifecycle(template);
+      case 'disks':   return renderDisksSection(vm, cluster, opts);
+      case 'network': return renderNetworkSection(vm, cluster);
+      case 'cloudinit': return renderCloudInit(cluster, opts);
+      default: return '';
+    }
+  }
+
+  function restartBanner() {
+    return `<p class="form-hint vm-edit-banner">${Icons.svg('warn', { size: 14 })} ${esc(tr('vm.edit.restartHint',
+      'Changes apply at the next VM restart (the running instance keeps the old layout — use the console reset button).'))}</p>`;
+  }
+
+  // La storage class d'une image ne se DÉDUIT pas de son nom. Harvester en
+  // crée une par image, mais sous deux conventions : `longhorn-image-xxxx`
+  // pour les anciennes, `lh-<uuid>` pour celles à backend backingimage.
+  // Fabriquer le nom donnait un PVC bloqué en Pending sur « storageclass
+  // not found », et une VM non planifiable — vécu sur harv1. On lit donc
+  // `status.storageClassName`, exposé par /api/images.
+  const imageStorageClass = new Map();     // "ns/name" -> storage class
+  const imageVirtualSize = new Map();      // "ns/name" -> octets
+  let storageCapacity = null;              // réponse de /api/storage-capacity
+
+  function primeImageStorageClasses(cluster) {
+    if (!cluster) return;
+    fetch(`/api/images/${encodeURIComponent(cluster)}`)
+      .then(r => r.json())
+      .then(list => (Array.isArray(list) ? list : []).forEach(i => {
+        if (!i || !i.namespace || !i.name) return;
+        const id = `${i.namespace}/${i.name}`;
+        if (i.storage_class) imageStorageClass.set(id, i.storage_class);
+        if (i.virtual_size) imageVirtualSize.set(id, Number(i.virtual_size));
+      }))
+      .catch(() => {});
+    fetch(`/api/storage-capacity/${encodeURIComponent(cluster)}`)
+      .then(r => r.json())
+      .then(d => { if (d && d.classes) storageCapacity = d; })
+      .catch(() => {});
+  }
+
+  const GIB = 1024 * 1024 * 1024;
+  const gib = (b) => Math.round((Number(b) || 0) / GIB * 10) / 10;
+
+  /** « 10Gi » -> octets. Renvoie 0 sur une saisie incomplète, ce qui est le
+   *  comportement voulu pendant la frappe. */
+  function parseSize(text) {
+    const m = /^([0-9]+)(Mi|Gi|Ti)$/.exec((text || '').trim());
+    if (!m) return 0;
+    const mult = { Mi: 1024 ** 2, Gi: GIB, Ti: 1024 ** 4 }[m[2]];
+    return Number(m[1]) * mult;
+  }
+
+  /** La place restante pour le disque en cours de saisie : l'allouable de sa
+   *  storage class MOINS ce que les autres disques de la même VM réclament
+   *  déjà sur la même classe. Sans cette soustraction, trois disques de
+   *  600 Gio paraîtraient tous tenir dans 1100 Gio. */
+  function renderDiskCapacity(editor) {
+    const hint = editor.parentElement
+      && editor.parentElement.querySelector('[data-disk-capacity]');
+    if (!hint) return;
+    if (!storageCapacity || !storageCapacity.classes) { hint.textContent = ''; return; }
+
+    const items = [...editor.querySelectorAll('.tf-block-item')];
+    const rows = items.map(it => {
+      const g = (n) => it.querySelector(`[name$=".${n}"]`);
+      const source = g('source') ? g('source').value : '';
+      const image = g('image') ? g('image').value : '';
+      const sc = source === 'image'
+        ? (imageStorageClass.get(image) || '')
+        : (g('storage_class') ? g('storage_class').value : '');
+      return { sc, bytes: parseSize(g('size') ? g('size').value : ''),
+               isNew: source === 'image' || source === 'blank',
+               // Un disque d'image SANS image choisie n'a pas encore de
+               // classe : ce n'est pas « rien à dire », c'est « il manque
+               // l'image ». Sans cette distinction, l'indication réclamait
+               // une source et une taille déjà saisies toutes les deux.
+               waitingImage: source === 'image' && !image };
+    });
+    const waitingImage = rows.some(r => r.waitingImage);
+    const usable = rows.filter(r => r.isNew && r.sc);
+
+    const byClass = new Map();
+    usable.forEach(r => byClass.set(r.sc, (byClass.get(r.sc) || 0) + r.bytes));
+
+    const unit = tr('vm.edit.capUnit', 'GiB');
+    const lines = [];
+    byClass.forEach((asked, sc) => {
+      const info = storageCapacity.classes[sc];
+      if (!info) return;
+      if (info.reason) {
+        lines.push(`${sc} : ${tr('vm.edit.capNone', 'no schedulable room')} (${info.replicas} ×)`);
+        return;
+      }
+      const left = info.allocatable - asked;
+      const over = left < 0;
+      lines.push(
+        // L'unité suit la langue (« Gio » en français, « GiB » ailleurs) et
+        // accompagne CHAQUE nombre. Elle manquait sur la quantité demandée :
+        // « 1107 Gio allocatable − 10 requested here » laissait deviner si ce
+        // 10 était des Gio, des Mio ou des disques.
+        `${sc} : ${gib(info.allocatable)} ${unit} ${tr('vm.edit.capAllocatable', 'allocatable')}`
+        + ` (${info.replicas} ${tr('vm.edit.capReplicas', 'replica(s)')})`
+        + (asked ? ` − ${gib(asked)} ${unit} ${tr('vm.edit.capAsked', 'requested here')}`
+                   + ` = ${over ? '−' : ''}${gib(Math.abs(left))} ${unit}` : ''));
+    });
+    hint.innerHTML = lines.length
+      ? lines.map(l => esc(l)).join('<br>')
+      : esc(waitingImage
+            ? tr('vm.edit.capPickImage',
+                 'Pick a VM image to see the room left.')
+            : tr('vm.edit.capHint',
+                 'Pick a source and a size to see the room left.'));
+    hint.classList.toggle('vm-cap-over',
+      [...byClass.entries()].some(([sc, asked]) => {
+        const i = storageCapacity.classes[sc];
+        return i && !i.reason && asked > i.allocatable;
+      }));
+  }
+
+  /** Une image impose un plancher : un disque plus petit que sa taille
+   *  virtuelle est refusé. On le propose donc dès qu'elle est choisie. */
+  function suggestSizeFromImage(editor) {
+    editor.querySelectorAll('.tf-block-item').forEach(it => {
+      const src = it.querySelector('[name$=".source"]');
+      const img = it.querySelector('[name$=".image"]');
+      const size = it.querySelector('[name$=".size"]');
+      if (!src || !img || !size) return;
+      if (src.value !== 'image' || !img.value) return;
+      if (size.value.trim()) return;               // ne jamais écraser une saisie
+      const virt = imageVirtualSize.get(img.value);
+      if (!virt) return;
+      size.value = `${Math.max(1, Math.ceil(virt / GIB))}Gi`;
+      size.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+
+  function renderDisksSection(vm, cluster, opts = {}) {
+    primeImageStorageClasses(cluster);
+    const { items, passthrough } = vmDisksToForm(vm, opts);
+    const template = ((vm.spec || {}).template || {}).spec || {};
+    const raw = { volumes: template.volumes || [],
+                  disks: ((template.domain || {}).devices || {}).disks || [] };
+    const locked = passthrough.volumes
+      .filter(v => v.cloudInitNoCloud || v.cloudInitConfigDrive)
+      .map(v => `<div class="vm-edit-locked">${Icons.svg('cloud')} <code>${esc(v.name)}</code> — ${esc(tr('vm.edit.cloudinitVol', 'cloud-init volume, managed by the Cloud-init tab'))}</div>`)
+      .join('');
+    return `
+      <h3>${esc(tr('vm.edit.disksTitle', 'Disks & Volumes'))}</h3>
+      ${restartBanner()}
+      <div class="vm-edit-cards" data-editor="disks">
+        ${TFForm.render(DISK_SCHEMA, cluster, { disk: items }, { hideHeader: true })}
+        <p class="form-hint vm-disk-capacity" data-disk-capacity></p>
+      </div>
+      ${locked}
+      <details class="vm-edit-adv">
+        <summary>${esc(tr('vm.edit.advanced', 'Advanced (raw JSON)'))}</summary>
+        <textarea class="yaml-editor" data-yaml="disks" spellcheck="false">${esc(toYaml(raw))}</textarea>
+      </details>
+      ${applyBar('disks')}`;
+  }
+
+  // ---------------------------------------------------------------------
+  // Chemin de connexion d'une VM (v1.36.0)
+  //
+  // On se met dans la peau d'un exploitant qui VÉRIFIE : la VM sort-elle
+  // par le bon réseau et la bonne carte ? La chaîne se lit de gauche à
+  // droite, de la VM jusqu'au cuivre, et chaque maillon porte ce qu'on
+  // sait de lui. Ce qui est DÉCLARÉ et ce qui est RÉEL sont distingués :
+  // un écart entre les deux est précisément ce qu'on cherche.
+  // ---------------------------------------------------------------------
+  function chainBox(kind, title, lines, cls) {
+    const copy = (v) => (window.CopyTo ? CopyTo.button(v) : '');
+    const body = lines.filter(Boolean)
+      .map(([k, v]) => `<div><span>${esc(k)}</span> <b>${esc(v)}</b>`
+                       + `${copy(v)}</div>`)
+      .join('');
+    return `<div class="netpath-box ${cls || ''}" data-kind="${esc(kind)}">`
+      + `<header>${Icons.svg(kind, { size: 13 })} ${esc(title)}`
+      + `${copy(title)}</header>`
+      + `<div class="netpath-kv">${body}</div></div>`;
+  }
+
+  function renderNetPath(d) {
+    if (d.error) return `<p class="hint">${esc(d.error)}</p>`;
+    if (!d.nics || !d.nics.length) {
+      return `<p class="hint">${esc(tr('vm.edit.netPathNone',
+        'This VM declares no network interface.'))}</p>`;
+    }
+    // Dire si l'on regarde ce qui TOURNE ou seulement ce qui est déclaré :
+    // sur une VM arrêtée, l'IP et l'état du lien n'existent pas, et croire
+    // le contraire ferait diagnostiquer une panne qui n'en est pas une.
+    const live = d.chain_is_live ? '' :
+      `<p class="hint netpath-warn">${esc(tr('vm.edit.netPathDeclared',
+        'This VM is not running: the chain below is the declared path, not '
+        + 'a live one. Address and link state are unknown until it starts.'))}</p>`;
+    const warn = d.full_linkmonitor ? '' :
+      `<p class="hint netpath-warn">${esc(tr('vm.edit.netPathPartial',
+        'Open vSwitch bridges are not reported by Harvester: a chain that '
+        + 'crosses them stops early. The Fabric view can install the link '
+        + 'monitor that reveals them.'))}</p>`;
+    const nics = d.nics.map(n => {
+      const live = n.live || {}, dec = n.declared || {}, nad = n.network_detail || {};
+      const boxes = [];
+      boxes.push(chainBox('vm', d.namespace + '/' + d.name, [
+        [tr('vm.edit.netPathNode', 'Node'), d.node || '-'],
+        [tr('vm.edit.netPathState', 'State'),
+         d.running ? tr('vm.edit.netPathRunning', 'running')
+                   : tr('vm.edit.netPathStopped', 'stopped')],
+      ]));
+      boxes.push(chainBox('network', n.name, [
+        [tr('vm.edit.netPathBinding', 'Binding'), dec.binding || '-'],
+        ['MAC', live.mac || dec.mac || '-'],
+        [tr('vm.edit.netPathGuest', 'In guest'), live.guest_interface || '-'],
+        ['IP', live.ip || '-'],
+        [tr('vm.edit.netPathLink', 'Link'), live.link_state || '-'],
+      ], live.link_state && live.link_state !== 'up' ? 'down' : ''));
+      boxes.push(chainBox('switch', dec.network || tr('vm.edit.netPathPod', 'pod network'), [
+        [tr('vm.edit.netPathType', 'Type'), nad.kind || '-'],
+        ['CNI', nad.cni || '-'],
+        ['VLAN', nad.vlan == null ? '-' : String(nad.vlan)],
+        [tr('vm.edit.netPathReady', 'Ready'), nad.ready === undefined ? '-' : String(nad.ready)],
+      ]));
+      (n.chain || []).forEach(c => {
+        if (!c.known) {
+          boxes.push(chainBox('warn', c.name, [
+            [tr('vm.edit.netPathUnknown', 'Not reported'), '-'],
+          ], 'unknown'));
+          return;
+        }
+        boxes.push(chainBox(c.type === 'device' ? 'node' : 'switch', c.name, [
+          [tr('vm.edit.netPathType', 'Type'), c.type],
+          [tr('vm.edit.netPathState', 'State'), c.state],
+          ['MAC', c.mac || '-'],
+        ], c.state === 'down' ? 'down' : ''));
+      });
+      const last = (n.chain || []).filter(c => c.known && c.type === 'device').pop();
+      const mac = live.mac || dec.mac || '';
+      const bridge = nad.bridge || '';
+      const tools =
+        (mac && bridge
+          ? `<button type="button" class="btn btn-small tip" data-netpath-port
+                     data-tip-i18n="vm.edit.netPathFindPortTip"
+                     data-mac="${esc(mac)}" data-bridge="${esc(bridge)}">`
+            + `${esc(tr('vm.edit.netPathFindPort', 'Which host port?'))}</button>` : '')
+        + (last
+          ? `<button type="button" class="btn btn-small tip" data-netpath-lldp
+                     data-tip-i18n="fabric.lldpTip"
+                     data-iface="${esc(last.name)}">`
+            + `${esc(tr('vm.edit.netPathLldp', 'Identify the switch (LLDP)'))}</button>` : '');
+      return `<div class="netpath-row">`
+        + `<div class="netpath-chain">${boxes.join('<i class="netpath-arrow"></i>')}</div>`
+        + `<div class="netpath-tools">${tools}<span class="netpath-out"></span></div>`
+        + (n.mac_matches ? '' :
+           `<p class="hint netpath-warn">${esc(tr('vm.edit.netPathMacGap',
+             'The declared MAC and the running one differ.'))}</p>`)
+        + `</div>`;
+    }).join('');
+    return live + warn + nics;
+  }
+
+  async function loadNetPath(sectionEl, cluster, namespace, name) {
+    const body = sectionEl.querySelector('[data-net-path-body]');
+    if (!body) return;
+    try {
+      const d = await fetch(`/api/vm-network-path/${encodeURIComponent(cluster)}`
+        + `/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`)
+        .then(r => r.json());
+      body.outerHTML = `<div data-net-path-body>${renderNetPath(d)}</div>`;
+      wireNetPathTools(sectionEl, cluster, namespace, name, d);
+    } catch (e) {
+      body.textContent = String(e.message || e);
+    }
+  }
+
+  function wireNetPathTools(sectionEl, cluster, namespace, name, d) {
+    if (window.CopyTo) CopyTo.wire(sectionEl);
+    // Les bulles lisent `data-tip`, que i18n ne pose qu'à son passage sur
+    // le document : ce rendu arrive après, il faut le faire ici.
+    if (window.i18n) {
+      sectionEl.querySelectorAll('[data-tip-i18n]').forEach(el => {
+        const t = i18n.t(el.getAttribute('data-tip-i18n'));
+        if (t) el.setAttribute('data-tip', t);
+      });
+    }
+
+    sectionEl.querySelectorAll('[data-netpath-port]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const out = btn.parentElement.querySelector('.netpath-out');
+        btn.disabled = true;
+        out.textContent = tr('common.loading', 'Loading...');
+        try {
+          const r = await fetch(`/api/vm-network-path/${encodeURIComponent(cluster)}`
+            + `/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/hostport`
+            + `?mac=${encodeURIComponent(btn.dataset.mac)}`
+            + `&bridge=${encodeURIComponent(btn.dataset.bridge)}`
+            + `&node=${encodeURIComponent(d.node || '')}`).then(x => x.json());
+          out.textContent = r.host_port
+            ? tr('vm.edit.netPathPortIs', 'Host port:') + ' ' + r.host_port
+            : tr('vm.edit.netPathPortNone', 'No host port matched this MAC.');
+        } catch (e) { out.textContent = String(e.message || e); }
+        btn.disabled = false;
+      });
+    });
+    sectionEl.querySelectorAll('[data-netpath-lldp]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const out = btn.parentElement.querySelector('.netpath-out');
+        btn.disabled = true;
+        out.textContent = tr('vm.edit.netPathListening', 'Listening for LLDP...');
+        try {
+          const r = await fetch(`/api/network-fabric/${encodeURIComponent(cluster)}`
+            + `/node/${encodeURIComponent(d.node || '')}/lldp`
+            + `?iface=${encodeURIComponent(btn.dataset.iface)}`).then(x => x.json());
+          out.textContent = r.found
+            ? window.Board.lldpText(r.fields)
+            : (r.hint || tr('vm.edit.netPathNoLldp', 'No LLDP frame.'));
+        } catch (e) { out.textContent = String(e.message || e); }
+        btn.disabled = false;
+      });
+    });
+  }
+
+  function renderNetworkSection(vm, cluster) {
+    const { items } = vmNetsToForm(vm);
+    const template = ((vm.spec || {}).template || {}).spec || {};
+    const raw = { networks: template.networks || [],
+                  interfaces: ((template.domain || {}).devices || {}).interfaces || [] };
+    // Deux vues : on ÉDITE les interfaces, et on VÉRIFIE par où elles
+    // sortent. La seconde répond à « cette VM est-elle branchée sur le bon
+    // réseau, par les bonnes cartes ? », qui ne se lit dans aucun formulaire.
+    return `
+      <h3>${esc(tr('vm.edit.netTitle', 'Network interfaces'))}</h3>
+      <div class="sub-tabs sub-tabs-inline" role="tablist"
+           aria-label="${esc(tr('vm.edit.netTitle', 'Network interfaces'))}">
+        <button type="button" class="sub-tab active" data-net-tab="edit">
+          ${Icons.svg('network', { size: 14 })}
+          <span>${esc(tr('vm.edit.netTabEdit', 'Interfaces'))}</span></button>
+        <button type="button" class="sub-tab tip" data-net-tab="path"
+                data-tip-i18n="vm.edit.netTabPathTip">
+          ${Icons.svg('node', { size: 14 })}
+          <span>${esc(tr('vm.edit.netTabPath', 'Connection path'))}</span></button>
+      </div>
+      <div data-net-pane="edit">
+        ${restartBanner()}
+        <div class="vm-edit-cards" data-editor="network">
+          ${TFForm.render(NET_SCHEMA, cluster, { nic: items }, { hideHeader: true })}
+        </div>
+        <details class="vm-edit-adv">
+          <summary>${esc(tr('vm.edit.advanced', 'Advanced (raw JSON)'))}</summary>
+          <textarea class="yaml-editor" data-yaml="network" spellcheck="false">${esc(toYaml(raw))}</textarea>
+        </details>
+        ${applyBar('network')}
+      </div>
+      <div data-net-pane="path" hidden>
+        <p class="hint" data-net-path-body>${esc(tr('common.loading', 'Loading...'))}</p>
+      </div>`;
+  }
+
+  const TAG_PREFIX = 'tag.harvesterhci.io/';
+
+  /** labels du template -> lignes {key,value} pour l'éditeur de tags */
+  function vmTagsToForm(vm) {
+    const labels = (((vm.spec || {}).template || {}).metadata || {}).labels || {};
+    return Object.keys(labels)
+      .filter(k => k.startsWith(TAG_PREFIX))
+      .sort()
+      .map(k => ({ key: k.slice(TAG_PREFIX.length), value: labels[k] }));
+  }
+
+  // v1.61.0 : les champs du formulaire de Harvester 1.9 (clés relevées dans
+  // harvester-ui-extension v1.9.0)
+  // v1.62.0 : labels de la VM, labels d'instance, annotations (onglets Labels,
+  // Instance Labels et Annotations de Harvester). Les clés système restent
+  // cachées et gardées, comme dans Harvester.
+  const KV_HIDDEN = {
+    labels: /^(harvesterhci\.io\/|kubevirt\.io\/|vm\.kubevirt\.io\/)/,
+    ilabels: /^(tag\.harvesterhci\.io\/|harvesterhci\.io\/|kubevirt\.io\/|vm\.kubevirt\.io\/|.*cattle\.io\/)/,
+    annots: /^(harvesterhci\.io\/|kubevirt\.io\/|kubectl\.kubernetes\.io\/|field\.cattle\.io\/|network\.harvesterhci\.io\/|static-ip\.harvesterhci\.io\/|.*cattle\.io\/)/,
+  };
+  const KV_KEY = /^([a-z0-9]([-a-z0-9.]*[a-z0-9])?\/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$/;
+  function kvSource(vm, kind) {
+    const md = vm.metadata || {};
+    const tm = ((vm.spec || {}).template || {}).metadata || {};
+    const src = kind === 'labels' ? md.labels : kind === 'ilabels' ? tm.labels : md.annotations;
+    return Object.entries(src || {}).filter(([k]) => !KV_HIDDEN[kind].test(k)).sort(([a], [b]) => a.localeCompare(b));
+  }
+  function kvRowHtml(kind, k = '', v = '') {
+    return `<div class="vm-kv-row" data-kv-row="${kind}">
+      <input type="text" data-kv="key" value="${esc(k)}" placeholder="${esc(tr('vm.edit.kvKey', 'key'))}" class="tip" data-tip="${esc(tr('vm.edit.tKvKey', 'A label or annotation key, e.g. app or example.com/team'))}">
+      <input type="text" data-kv="value" value="${esc(v)}" placeholder="${esc(tr('vm.edit.kvValue', 'value'))}" class="tip" data-tip="${esc(tr('vm.edit.tKvValue', 'Its value'))}">
+      <button type="button" class="btn-icon-sm tip" data-kv-del data-tip="${esc(tr('vm.edit.tKvDel', 'Remove this entry'))}">×</button></div>`;
+  }
+  function kvBlock(vm, kind, title, hint) {
+    const rows = kvSource(vm, kind);
+    return `<details class="vm-edit-adv vm-kv" data-kv-block="${kind}" ${rows.length ? 'open' : ''}>
+      <summary>${esc(title)} <span class="res-dim">(${rows.length})</span></summary>
+      <p class="form-hint">${esc(hint)}</p>
+      <div class="vm-kv-rows">${rows.map(([k, v]) => kvRowHtml(kind, k, v)).join('')}</div>
+      <button type="button" class="btn btn-sm btn-secondary tip" data-kv-add="${kind}" data-tip="${esc(tr('vm.edit.tKvAdd', 'Add an entry'))}">${Icons.svg('add', { size: 13 })} ${esc(tr('vm.edit.kvAdd', 'Add'))}</button>
+    </details>`;
+  }
+  /** Les entrées saisies, avec null pour celles retirées (merge patch). */
+  function kvRead(sectionEl, vm, kind) {
+    const out = {};
+    const seen = new Set();
+    sectionEl.querySelectorAll(`[data-kv-row="${kind}"]`).forEach(row => {
+      const k = row.querySelector('[data-kv="key"]').value.trim();
+      const v = row.querySelector('[data-kv="value"]').value;
+      if (!k) return;
+      if (!KV_KEY.test(k) || KV_HIDDEN[kind].test(k)) throw new Error(`${tr('vm.edit.errKvKey', 'invalid or reserved key')}: "${k}"`);
+      if (seen.has(k)) throw new Error(`${tr('vm.edit.errTagDup', 'duplicate tag key')}: ${k}`);
+      seen.add(k);
+      out[k] = v;
+    });
+    kvSource(vm, kind).forEach(([k]) => { if (!seen.has(k)) out[k] = null; });
+    return out;
+  }
+
+  const OS_TYPES = ['windows', 'linux', 'SLEs', 'debian', 'fedora', 'gentoo', 'oracle', 'redhat', 'openSUSE', 'ubuntu', 'otherLinux'];
+  const MAINTAIN = ['Migrate', 'ShutdownAndRestartAfterEnable', 'ShutdownAndRestartAfterDisable', 'Shutdown'];
+
+  function renderGeneral(vm, spec, annot, cluster) {
+    // Harvester lit la description dans field.cattle.io/description ; la
+    // console l'écrivait dans harvesterhci.io/description (relu encore)
+    const description = annot['field.cattle.io/description'] || annot['harvesterhci.io/description'] || annot['description'] || '';
+    const vlabels = vm.metadata.labels || {};
+    const os = vlabels['harvesterhci.io/os'] || '';
+    const maintain = vlabels['harvesterhci.io/maintain-mode-strategy'] || 'Migrate';
+    const hostname = ((spec.template || {}).spec || {}).hostname || '';
+    const tagItems = vmTagsToForm(vm);
+    return `
+      <h3>${esc(tr('vm.edit.general', 'General'))}</h3>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fName', 'Name'))}</label>
+        <input type="text" value="${esc(vm.metadata.name)}" readonly>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fNamespace', 'Namespace'))}</label>
+        <input type="text" value="${esc(vm.metadata.namespace)}" readonly>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fDisplayName', 'Display name'))}</label>
+        <input type="text" data-field="annot.displayName" value="${esc(annot['harvesterhci.io/vmDisplayName'] || '')}"
+               placeholder="${esc(vm.metadata.name)}" class="tip" data-tip="${esc(tr('vm.edit.tDisplayName', 'The name Harvester shows in its lists instead of the VM name'))}">
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fDescription', 'Description'))}</label>
+        <textarea data-field="annot.description" rows="2">${esc(description)}</textarea>
+      </div>
+      <div class="grid-2">
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fOsType', 'Operating system'))}</label>
+          <select data-field="label.os" class="tip" data-tip="${esc(tr('vm.edit.tOsType', 'The guest OS, as in Harvester (label harvesterhci.io/os)'))}">
+            <option value="">${esc(tr('vm.edit.osUnset', '(not set)'))}</option>
+            ${OS_TYPES.map(v => `<option value="${v}" ${os === v ? 'selected' : ''}>${v}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fMaintain', 'Maintenance strategy'))}</label>
+          <select data-field="label.maintain" class="tip" data-tip="${esc(tr('vm.edit.tMaintain', 'What happens to the VM when its node enters maintenance: migrate it, or shut it down (and restart it after)'))}">
+            ${MAINTAIN.map(v => `<option value="${v}" ${maintain === v ? 'selected' : ''}>${v}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fRunStrategy', 'Run strategy'))}</label>
+        <select data-field="spec.runStrategy">
+          ${['Always','RerunOnFailure','Manual','Halted'].map(v =>
+            `<option value="${v}" ${spec.runStrategy === v ? 'selected' : ''}>${v}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.hostname', 'Guest hostname'))}</label>
+        <input type="text" data-field="spec.hostname" value="${esc(hostname)}"
+               placeholder="${esc(vm.metadata.name)}">
+        <span class="form-hint">${esc(tr('vm.edit.hostnameHint', 'Empty = the VM name is used'))}</span>
+      </div>
+      <h3>${Icons.svg('tag')} ${esc(tr('vm.edit.tags', 'Tags'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.tagsHint', 'Harvester tags (labels tag.harvesterhci.io/<key>) — also shown in the Harvester UI.'))}</p>
+      <div class="vm-edit-cards" data-cards="tags">
+        ${TFForm.render(TAG_SCHEMA, cluster, { tag: tagItems }, { hideHeader: true })}
+      </div>
+      ${kvBlock(vm, 'labels', tr('vm.edit.kvLabels', 'Labels'), tr('vm.edit.kvLabelsHint', 'Labels of the VM object itself.'))}
+      ${kvBlock(vm, 'ilabels', tr('vm.edit.kvInstance', 'Instance labels'), tr('vm.edit.kvInstanceHint', 'Labels copied to the running instance (VMI): load balancer selectors and affinity rules read them.'))}
+      ${kvBlock(vm, 'annots', tr('vm.edit.kvAnnots', 'Annotations'), tr('vm.edit.kvAnnotsHint', 'Annotations of the VM; Harvester\'s own keys stay hidden and are kept.'))}
+      ${applyBar('general')}`;
+  }
+
+  function renderCompute(domain, vmRef = {}) {
+    const cpu = domain.cpu || {};
+    const mem = domain.memory || {};
+    const res = (domain.resources || {}).requests || {};
+    const lim = (domain.resources || {}).limits || {};
+    return `
+      <h3>${esc(tr('vm.edit.computeTitle', 'Compute resources'))}</h3>
+      <div class="grid-2">
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fSockets', 'CPU sockets'))}</label>
+          <input type="number" min="1" data-field="cpu.sockets" value="${cpu.sockets ?? 1}">
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fCores', 'CPU cores'))}</label>
+          <input type="number" min="1" data-field="cpu.cores" value="${cpu.cores ?? 1}">
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fThreads', 'Threads per core'))}</label>
+          <input type="number" min="1" data-field="cpu.threads" value="${cpu.threads ?? 1}">
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fMemory', 'Memory (guest)'))}</label>
+          <input type="text" data-field="memory.guest" value="${esc(mem.guest || '')}" placeholder="4Gi">
+        </div>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fReserved', 'Reserved memory'))}</label>
+        <input type="text" data-field="annot.reservedMemory" value="${esc(((vmRef.metadata || {}).annotations || {})['harvesterhci.io/reservedMemory'] || '')}"
+               placeholder="100Mi" class="tip" data-tip="${esc(tr('vm.edit.tReserved', 'Memory kept for KubeVirt out of the VM\'s limit (harvesterhci.io/reservedMemory); empty: Harvester keeps 100Mi'))}">
+      </div>
+      <label class="bk-check tip" data-tip="${esc(tr('vm.edit.tHotplugOn', 'As in Harvester: one core per socket, the maximums below become the limits, and \'Edit CPU and memory\' changes the VM while it runs'))}">
+        <input type="checkbox" data-field="cpu.hotplugOn" ${(((vmRef.metadata || {}).annotations || {})['harvesterhci.io/enableCPUAndMemoryHotplug'] === 'true') ? 'checked' : ''}>
+        <span>${esc(tr('vm.edit.fHotplugOn', 'Enable CPU and memory hotplug'))}</span></label>
+      <h3>${esc(tr('vm.edit.hotplug', 'Hot-plug ceilings'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.hotplugHint', 'Set these ABOVE the current values to allow adding CPU or memory without a reboot later. They cannot be lowered while the VM runs.'))}</p>
+      <div class="grid-2">
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.maxSockets', 'Max CPU sockets (hot-plug)'))}</label>
+          <input type="number" min="0" data-field="cpu.maxSockets" value="${cpu.maxSockets ?? ''}"
+                 placeholder="${cpu.sockets ?? 1}">
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.maxGuest', 'Max guest memory (hot-plug)'))}</label>
+          <input type="text" data-field="memory.maxGuest" value="${esc(mem.maxGuest || '')}"
+                 placeholder="${esc(mem.guest || '8Gi')}">
+        </div>
+      </div>
+      <h3>${esc(tr('vm.edit.cpuModel', 'CPU model'))}</h3>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.cpuModel', 'CPU model'))}</label>
+        <input type="text" data-field="cpu.model" value="${esc(cpu.model || '')}"
+               list="dl-cpu-model" autocomplete="off" placeholder="(default)">
+        <datalist id="dl-cpu-model">
+          <option value="host-model"></option>
+          <option value="host-passthrough"></option>
+          <option value="Skylake-Server"></option>
+          <option value="Cascadelake-Server"></option>
+        </datalist>
+        <span class="form-hint">${esc(tr('vm.edit.cpuModelHint', 'host-passthrough is fastest but blocks live migration to a different CPU; host-model is the usual compromise. Empty = cluster default.'))}</span>
+      </div>
+      <h3>${esc(tr('vm.edit.pinning', 'CPU pinning'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.pinningHint', 'For latency-sensitive workloads. Pinning requires enough full cores on the node and rules out CPU overcommit for this VM.'))}</p>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="cpu.dedicated" ${cpu.dedicatedCpuPlacement ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.dedicatedCpu', 'Dedicated CPU placement (pinning)'))}</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="cpu.isolate" ${cpu.isolateEmulatorThread ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.isolateEmulator', 'Isolate the emulator thread on its own core'))}</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="cpu.numa" ${(cpu.numa && cpu.numa.guestMappingPassthrough) ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.numa', 'Pass the host NUMA topology to the guest'))}</span>
+        </label>
+      </div>
+      <details class="vm-edit-adv">
+        <summary>${esc(tr('vm.edit.resAdvanced', 'Scheduling reservations (advanced)'))}</summary>
+        <p class="form-hint">${esc(tr('vm.edit.resHint', 'What Kubernetes actually schedules. Harvester derives these from the overcommit ratio — override only if you know why. Empty = leave as-is.'))}</p>
+        <div class="grid-2">
+          <div class="form-row">
+            <label>limits.cpu</label>
+            <input type="text" data-field="res.limits.cpu" value="${esc(lim.cpu || '')}" placeholder="2">
+          </div>
+          <div class="form-row">
+            <label>limits.memory</label>
+            <input type="text" data-field="res.limits.memory" value="${esc(lim.memory || '')}" placeholder="4Gi">
+          </div>
+          <div class="form-row">
+            <label>requests.cpu</label>
+            <input type="text" data-field="res.requests.cpu" value="${esc(res.cpu || '')}" placeholder="125m">
+          </div>
+          <div class="form-row">
+            <label>requests.memory</label>
+            <input type="text" data-field="res.requests.memory" value="${esc(res.memory || '')}" placeholder="2730Mi">
+          </div>
+        </div>
+      </details>
+      <p class="form-hint">${esc(tr('vm.edit.computeHint', 'Changing CPU/memory while the VM is running may require a reboot for the guest to see the new values.'))}</p>
+      ${applyBar('compute')}`;
+  }
+
+  // v1.12.0 — Firmware : UEFI / Secure Boot / TPM / type de machine.
+  // Débloque les invités modernes (Windows 11, SLE 16) qui refusent de
+  // booter en BIOS hérité ou exigent un TPM 2.0.
+  function renderFirmware(domain, cluster) {
+    const dev = domain.devices || {};
+    const hasTablet = (dev.inputs || []).some(i => i.type === 'tablet');
+    const wd = dev.watchdog || null;
+    const wdAction = wd ? ((wd.i6300esb || {}).action || 'reset') : '';
+    const hostDevs = [
+      ...(dev.hostDevices || []).map(d => ({ kind: 'host', name: d.name, device_name: d.deviceName })),
+      ...(dev.gpus || []).map(d => ({ kind: 'gpu', name: d.name, device_name: d.deviceName })),
+    ];
+    const fw   = domain.firmware || {};
+    const boot = fw.bootloader || {};
+    const efi  = boot.efi || null;
+    const mode = efi ? (efi.secureBoot === false ? 'uefi' : 'uefi-sb') : 'bios';
+    const tpm  = (domain.devices || {}).tpm || null;
+    const machine = (domain.machine || {}).type || '';
+    const opt = (v, cur, label) =>
+      `<option value="${v}" ${cur === v ? 'selected' : ''}>${label}</option>`;
+    return `
+      <h3>${Icons.svg('firmware')} ${esc(tr('vm.edit.firmware', 'Firmware'))}</h3>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.bootMode', 'Boot mode'))}</label>
+        <select data-field="fw.mode">
+          ${opt('bios', mode, 'BIOS (legacy)')}
+          ${opt('uefi', mode, 'UEFI')}
+          ${opt('uefi-sb', mode, 'UEFI + Secure Boot')}
+        </select>
+        <span class="form-hint">${esc(tr('vm.edit.bootModeHint', 'Windows 11 and recent SLES/openSUSE images need UEFI; Secure Boot additionally enables the SMM feature. Switching mode on an installed guest usually makes it unbootable — set it before the first install.'))}</span>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="fw.tpm" ${tpm ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.tpm', 'Attach a TPM 2.0 device'))}</span>
+        </label>
+        <span class="form-hint">${esc(tr('vm.edit.tpmHint', 'Required by Windows 11. Persistent keeps the TPM state across reboots (needed for BitLocker).'))}</span>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="fw.tpmPersistent" ${(tpm && tpm.persistent) ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.tpmPersistent', 'Persistent TPM state'))}</span>
+        </label>
+      </div>
+      <div class="grid-2">
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.machineType', 'Machine type'))}</label>
+          <input type="text" data-field="fw.machine" value="${esc(machine)}"
+                 list="dl-machine" autocomplete="off" placeholder="q35">
+          <datalist id="dl-machine">
+            <option value="q35"></option>
+            <option value="pc"></option>
+          </datalist>
+        </div>
+        <div class="form-row">
+          <label>${esc(tr('vm.edit.fwSerial', 'Firmware serial number'))}</label>
+          <input type="text" data-field="fw.serial" value="${esc(fw.serial || '')}"
+                 placeholder="(auto)">
+          <span class="form-hint">${esc(tr('vm.edit.fwSerialHint', 'Some licences are bound to it. Empty = leave as-is.'))}</span>
+        </div>
+      </div>
+      <h3>${esc(tr('vm.edit.devices', 'Devices'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.devicesHint', 'KubeVirt attaches these by default; untick to remove them from the guest.'))}</p>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="dev.serialConsole" ${dev.autoattachSerialConsole === false ? '' : 'checked'}>
+          <span>${esc(tr('vm.edit.serialConsole', 'Serial console'))}</span>
+        </label>
+        <span class="form-hint">${esc(tr('vm.edit.serialConsoleHint', 'Needed to read the boot log without a graphical console (virtctl console).'))}</span>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="dev.graphics" ${dev.autoattachGraphicsDevice === false ? '' : 'checked'}>
+          <span>${esc(tr('vm.edit.graphics', 'Graphics device (VNC)'))}</span>
+        </label>
+        <span class="form-hint">${esc(tr('vm.edit.graphicsHint', 'Removing it also removes the VNC console of this VM.'))}</span>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="dev.balloon" ${dev.autoattachMemBalloon === false ? '' : 'checked'}>
+          <span>${esc(tr('vm.edit.balloon', 'Memory balloon'))}</span>
+        </label>
+        <span class="form-hint">${esc(tr('vm.edit.balloonHint', 'Lets the host reclaim unused guest memory. Turn it off for latency-sensitive or hugepage workloads.'))}</span>
+      </div>
+      <div class="form-row">
+        <label class="opt-row">
+          <input type="checkbox" data-field="dev.tablet" ${hasTablet ? 'checked' : ''}>
+          <span>${esc(tr('vm.edit.tablet', 'USB tablet pointer'))}</span>
+        </label>
+        <span class="form-hint">${esc(tr('vm.edit.tabletHint', 'Makes the mouse track correctly in the VNC console instead of drifting.'))}</span>
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.watchdog', 'Watchdog'))}</label>
+        <select data-field="dev.watchdog">
+          ${['', 'reset', 'poweroff', 'shutdown'].map(v =>
+            `<option value="${v}" ${wdAction === v ? 'selected' : ''}>${v || tr('vm.edit.wdNone', '(none)')}</option>`).join('')}
+        </select>
+        <span class="form-hint">${esc(tr('vm.edit.watchdogHint', 'i6300esb watchdog: the guest must feed it (watchdog daemon), otherwise the chosen action fires when it freezes.'))}</span>
+      </div>
+      <h3>${esc(tr('vm.edit.passthrough', 'PCI / GPU passthrough'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.passthroughHint', 'The picker lists the PCI devices Harvester discovered, as address · node · driver. Only a device claimed in Harvester (driver vfio-pci) can be used; harvester-ops never claims one for you. Verified on a test cluster: a network card and an SR-IOV virtual function reached the guest.'))}</p>
+      <div class="vm-edit-cards" data-cards="hostdev">
+        ${TFForm.render(HOSTDEV_SCHEMA, cluster, { dev: hostDevs }, { hideHeader: true })}
+      </div>
+      ${restartBanner()}
+      ${applyBar('firmware')}`;
+  }
+
+  /** nodeSelector -> lignes, et règles pod -> lignes éditables */
+  function vmPlacementToForm(vm) {
+    const t = (((vm.spec || {}).template || {}).spec) || {};
+    const sel = Object.entries(t.nodeSelector || {}).map(([key, value]) => ({ key, value }));
+    const aff = t.affinity || {};
+    const rules = [];
+    const harvest = (block, kind) => {
+      if (!block) return;
+      (block.requiredDuringSchedulingIgnoredDuringExecution || []).forEach(term => {
+        const m = ((term.labelSelector || {}).matchLabels) || {};
+        Object.entries(m).forEach(([k, v]) => rules.push({
+          kind, hard: true,
+          key: k.startsWith(TAG_PREFIX) ? k.slice(TAG_PREFIX.length) : k, value: v,
+        }));
+      });
+      (block.preferredDuringSchedulingIgnoredDuringExecution || []).forEach(w => {
+        const m = (((w.podAffinityTerm || {}).labelSelector || {}).matchLabels) || {};
+        Object.entries(m).forEach(([k, v]) => rules.push({
+          kind, hard: false,
+          key: k.startsWith(TAG_PREFIX) ? k.slice(TAG_PREFIX.length) : k, value: v,
+        }));
+      });
+    };
+    harvest(aff.podAntiAffinity, 'avoid');
+    harvest(aff.podAffinity, 'attract');
+    return { sel, rules };
+  }
+
+  /** lignes -> blocs podAffinity / podAntiAffinity (null si vide) */
+  function formPlacementToAffinity(rules) {
+    const mk = (list) => {
+      const hard = list.filter(r => r.hard).map(r => ({
+        labelSelector: { matchLabels: { [TAG_PREFIX + r.key]: String(r.value) } },
+        topologyKey: 'kubernetes.io/hostname',
+      }));
+      const soft = list.filter(r => !r.hard).map(r => ({
+        weight: 100,
+        podAffinityTerm: {
+          labelSelector: { matchLabels: { [TAG_PREFIX + r.key]: String(r.value) } },
+          topologyKey: 'kubernetes.io/hostname',
+        },
+      }));
+      if (!hard.length && !soft.length) return null;
+      const out = {};
+      out.requiredDuringSchedulingIgnoredDuringExecution = hard;
+      out.preferredDuringSchedulingIgnoredDuringExecution = soft;
+      return out;
+    };
+    return {
+      podAntiAffinity: mk(rules.filter(r => r.kind !== 'attract')),
+      podAffinity: mk(rules.filter(r => r.kind === 'attract')),
+    };
+  }
+
+  function renderPlacement(vm, template, cluster) {
+    const { sel, rules } = vmPlacementToForm(vm);
+    const tolerations = (template.tolerations || []).map(t => ({
+      key: t.key || '', operator: t.operator || 'Equal',
+      value: t.value || '', effect: t.effect || '',
+    }));
+    const managed = ((template.affinity || {}).nodeAffinity) || null;
+    return `
+      <h3>${Icons.svg('placement')} ${esc(tr('vm.edit.placement', 'Placement'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.nodeSelHint', 'Pin the VM to nodes carrying these labels. Empty = the scheduler is free.'))}</p>
+      <div class="vm-edit-cards" data-cards="nodesel">
+        ${TFForm.render(NODESEL_SCHEMA, cluster, { sel }, { hideHeader: true })}
+      </div>
+      <h3>${esc(tr('vm.edit.tolerations', 'Tolerations'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.tolerationsHint', 'Let this VM schedule onto nodes carrying a taint (a dedicated or drained node, for example).'))}</p>
+      <div class="vm-edit-cards" data-cards="tolerations">
+        ${TFForm.render(TOLERATION_SCHEMA, cluster, { tol: tolerations }, { hideHeader: true })}
+      </div>
+      <h3>${esc(tr('vm.edit.affinityTitle', 'Rules relative to other VMs'))}</h3>
+      <p class="form-hint">${esc(tr('vm.edit.affinityHint', 'Keep a VM away from its twin (HA pair) or next to a VM it talks to a lot. Matching is done on Harvester tags, so tag both VMs first.'))}</p>
+      <div class="vm-edit-cards" data-cards="affinity">
+        ${TFForm.render(AFFINITY_SCHEMA, cluster, { rule: rules }, { hideHeader: true })}
+      </div>
+      ${managed ? `
+        <details class="vm-edit-adv">
+          <summary>${esc(tr('vm.edit.managedAffinity', 'Node affinity managed by Harvester (read-only)'))}</summary>
+          <p class="form-hint">${esc(tr('vm.edit.managedAffinityHint', 'Harvester derives this from the networks the VM is attached to. It is left untouched when you save.'))}</p>
+          <pre>${esc(JSON.stringify(managed, null, 2))}</pre>
+        </details>` : ''}
+      ${restartBanner()}
+      ${applyBar('placement')}`;
+  }
+
+  function renderLifecycle(template) {
+    return `
+      <h3>${esc(tr('vm.edit.lifecycle', 'Lifecycle'))}</h3>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fGrace', 'ACPI shutdown grace period (seconds)'))}</label>
+        <input type="number" min="0" data-field="lifecycle.terminationGracePeriodSeconds" value="${template.terminationGracePeriodSeconds ?? 180}">
+      </div>
+      <div class="form-row">
+        <label>${esc(tr('vm.edit.fEviction', 'Eviction strategy'))}</label>
+        <select data-field="lifecycle.evictionStrategy">
+          <option value="">(none)</option>
+          <option value="LiveMigrate"      ${template.evictionStrategy === 'LiveMigrate' ? 'selected' : ''}>LiveMigrate</option>
+          <option value="External"         ${template.evictionStrategy === 'External' ? 'selected' : ''}>External</option>
+          <option value="LiveMigrateIfPossible" ${template.evictionStrategy === 'LiveMigrateIfPossible' ? 'selected' : ''}>LiveMigrateIfPossible</option>
+        </select>
+      </div>
+      ${applyBar('lifecycle')}`;
+  }
+
+  // v1.62.0 : à la création seulement, comme Harvester : fichier de réponses
+  // Windows (Secret autounattend.xml, lecteur sysprep) et volumes virtiofs
+  function renderCreateExtras() {
+    const fsRow = (kind) => `<div class="vm-kv-row vm-fs-row" data-fs-kind="${kind}">
+        <span class="res-dim">${esc(kind)}</span>
+        <input type="text" data-fs="source" placeholder="${esc(tr('vm.create.fsSource', 'name of the source'))}" class="tip" data-tip="${esc(tr('vm.create.tFsSource', 'The ConfigMap, Secret or ServiceAccount of the namespace to share; empty = none'))}">
+        <input type="text" data-fs="name" placeholder="${esc({ configMap: 'appconfigfs', secret: 'appsecretfs', serviceAccount: 'appserviceaccountfs' }[kind])}" class="tip" data-tip="${esc(tr('vm.create.tFsName', 'The tag to mount in the guest: mount -t virtiofs <tag> /mnt/<tag>'))}">
+      </div>`;
+    return `
+      <details class="vm-edit-adv">
+        <summary>${esc(tr('vm.create.sysprep', 'Windows answer file (autounattend.xml)'))}</summary>
+        <p class="form-hint">${esc(tr('vm.create.sysprepHint', 'Given to Windows Setup on a SATA CD-ROM named sysprep, from a Secret, as Harvester does.'))}</p>
+        <textarea class="yaml-editor" data-sysprep spellcheck="false" placeholder="&lt;unattend xmlns=&quot;urn:schemas-microsoft-com:unattend&quot;&gt;…"></textarea>
+      </details>
+      <details class="vm-edit-adv">
+        <summary>${esc(tr('vm.create.fs', 'Filesystem volumes (virtiofs)'))}</summary>
+        <p class="form-hint">${esc(tr('vm.create.fsHint', 'Share a ConfigMap, a Secret or a ServiceAccount with the guest as a virtiofs filesystem (one of each at most, set at creation).'))}</p>
+        ${['configMap', 'secret', 'serviceAccount'].map(fsRow).join('')}
+      </details>`;
+  }
+
+  function renderCloudInit(cluster, opts = {}) {
+    return `${opts.claimsAreToCreate ? renderCreateExtras() : ''}
+      <h3>Cloud-init</h3>
+      <p class="form-hint">Edit user-data and network-data. Saved to the VM's cloud-init Secret.</p>
+      <details class="vm-edit-adv vm-edit-ci-wizard">
+        <summary>${Icons.svg('wizard')} ${esc(tr('vm.edit.ci.wizard', 'Assistant — generate the YAML below'))}</summary>
+        <p class="form-hint">${esc(tr('vm.edit.ci.wizardHint',
+          'Fill in what you need, then Generate: the editors below are replaced with clean cloud-config / network-data v1 YAML. Review, then Save.'))}</p>
+        <h4>${esc(tr('vm.edit.ci.userTitle', 'System (user-data)'))}</h4>
+        <div class="vm-edit-ci-userform">
+          ${CI_USER_SCHEMA.sections.map(sec => `
+            <h5 class="vm-edit-ci-sec">${esc(TFForm && window.i18n ? (sec.label[i18n.currentLang] || sec.label.en) : sec.label.en)}</h5>
+            ${TFForm.render(CI_USER_SCHEMA, cluster, {}, { hideHeader: true, sectionId: sec.id })}`).join('')}
+        </div>
+        <div class="apply-bar">
+          <button class="btn btn-sm btn-primary" data-action="gen-userdata">${esc(tr('vm.edit.ci.genUser', 'Generate user-data'))}</button>
+          <span class="apply-result" data-section="ci-user"></span>
+        </div>
+        <h4>${esc(tr('vm.edit.ci.netTitle', 'Network (network-data)'))}</h4>
+        <div class="vm-edit-ci-netform">${TFForm.render(CI_NET_SCHEMA, cluster, {}, { hideHeader: true })}</div>
+        <div class="apply-bar">
+          <button class="btn btn-sm btn-primary" data-action="gen-netdata">${esc(tr('vm.edit.ci.genNet', 'Generate network-data'))}</button>
+          <span class="apply-result" data-section="ci-net"></span>
+        </div>
+      </details>
+      <div class="form-row">
+        <label>user-data (YAML / shell script)</label>
+        <textarea class="yaml-editor tall" data-ci="userData" spellcheck="false"></textarea>
+      </div>
+      <div class="form-row">
+        <label>network-data (YAML)</label>
+        <textarea class="yaml-editor" data-ci="networkData" spellcheck="false"></textarea>
+      </div>
+      <div class="form-hint" id="ci-source"></div>
+      <div class="apply-bar">
+        <label class="apply-dry tip" data-tip="${esc(tr('vm.create.guestAgentTip', 'Adds qemu-guest-agent to the cloud-init: IP addresses, soft reboot and access credentials need it'))}">
+          <input type="checkbox" data-ci-agent> ${esc(tr('vm.create.guestAgent', 'Install the guest agent'))}</label>
+        <button class="btn btn-primary btn-sm tip" data-action="apply-cloudinit" data-tip="${esc(tr('vm.edit.ci.saveTip', 'Save to the VM\'s cloud-init secret (created and attached if the VM has none); the VM reads it at its next boot; followed in the dock'))}">${esc(tr('vm.edit.ci.save', 'Save cloud-init'))}</button>
+        <button class="btn btn-secondary btn-sm tip" data-action="reload-cloudinit" data-tip="${esc(tr('yw.reloadTip', 'Read it again from the cluster'))}">${esc(tr('yw.reload', 'Reload'))}</button>
+        <span class="apply-result" data-section="cloudinit"></span>
+      </div>`;
+  }
+
+  function applyBar(section) {
+    return `
+      <div class="apply-bar">
+        <label class="apply-dry">
+          <input type="checkbox" data-dry-run> ${esc(tr('vm.edit.dryRun', 'Dry-run (validate only)'))}
+        </label>
+        <button class="btn btn-primary btn-sm" data-action="apply" data-section="${section}">${esc(tr('vm.edit.apply', 'Apply changes'))}</button>
+        <button class="btn btn-secondary btn-sm" data-action="reset" data-section="${section}">${esc(tr('vm.edit.reset', 'Reset'))}</button>
+        <span class="apply-result" data-section="${section}"></span>
+      </div>`;
+  }
+
+  // =========================================================================
+  // Apply wiring
+  // =========================================================================
+
+  /** Show/hide the source-dependent fields of every disk card. */
+  function syncDiskSourceFields(rootEl) {
+    rootEl.querySelectorAll('.tf-block-item').forEach(item => {
+      const src = item.querySelector('[name$=".source"]')?.value || 'pvc';
+      // La storage class reste AFFICHÉE pour un disque d'image, verrouillée
+      // sur la valeur héritée, au lieu de disparaître : la classe d'une image
+      // porte `backingImage` (vérifié sur harv1), et c'est elle qui fait
+      // démarrer le disque. En choisir une autre donnerait un disque vide.
+      // Masquer le champ laissait « pourquoi je ne peux pas la choisir ? »
+      // sans aucune réponse à l'écran.
+      const show = { pvc: src === 'pvc', image: src === 'image',
+                     size: src !== 'pvc', storage_class: src !== 'pvc' };
+      Object.entries(show).forEach(([field, visible]) => {
+        const el = item.querySelector(`[name$=".${field}"]`);
+        const wrap = el && el.closest('.tf-field');
+        if (wrap) wrap.style.display = visible ? '' : 'none';
+      });
+      lockInheritedStorageClass(item, src);
+    });
+  }
+
+  /** Disque d'image : afficher la storage class héritée, non modifiable. */
+  function lockInheritedStorageClass(item, src) {
+    const sel = item.querySelector('[name$=".storage_class"]');
+    if (!sel || sel.tagName !== 'SELECT') return;
+    if (src !== 'image') {
+      Array.from(sel.options).filter(o => o.dataset.waiting === '1')
+        .forEach(o => o.remove());
+      sel.disabled = false;
+      sel.removeAttribute('title');
+      return;
+    }
+    const imageId = item.querySelector('[name$=".image"]')?.value || '';
+    const inherited = imageStorageClass.get(imageId) || '';
+    if (inherited) {
+      // La liste peut ne pas être encore chargée : injecter l'option plutôt
+      // que d'afficher un champ vide qui ferait croire à une classe absente.
+      if (!Array.from(sel.options).some(o => o.value === inherited)) {
+        sel.add(new Option(inherited, inherited));
+      }
+      sel.value = inherited;
+    } else {
+      // Aucune image choisie : la classe n'est pas « vide », elle est encore
+      // INCONNUE. Un select grisé sur l'option vide donne un champ qui a
+      // l'air cassé ; on dit d'où elle viendra.
+      const waiting = tr('vm.edit.scFromImage', '(follows the image)');
+      let opt = Array.from(sel.options).find(o => o.dataset.waiting === '1');
+      if (!opt) {
+        opt = new Option(waiting, '');
+        opt.dataset.waiting = '1';
+        sel.add(opt, sel.options[0] || null);
+      }
+      opt.textContent = waiting;
+      sel.value = '';
+    }
+    sel.disabled = true;
+    sel.title = tr('vm.edit.scInherited',
+                   'Imposed by the image: this class carries the backing image.');
+  }
+
+  function syncNicTypeFields(rootEl) {
+    rootEl.querySelectorAll('.tf-block-item').forEach(item => {
+      const type = item.querySelector('[name$=".type"]')?.value || 'bridge';
+      const el = item.querySelector('[name$=".network"]');
+      const wrap = el && el.closest('.tf-field');
+      if (wrap) wrap.style.display = type === 'bridge' ? '' : 'none';
+    });
+  }
+
+  /**
+   * @param opts.createMode  la VM n'existe pas encore (panneau de création) :
+   *   il n'y a rien à charger depuis le cluster et rien à patcher. Les
+   *   assistants et les éditeurs, eux, se câblent normalement — c'est tout
+   *   l'intérêt de rejouer ces sections plutôt que d'en écrire d'autres.
+   */
+  function wireSection(sectionEl, sectionId, cluster, namespace, name, getVM,
+                       opts = {}) {
+    const createMode = !!opts.createMode;
+
+    // Bascule entre « Interfaces » (on édite) et « Chemin » (on vérifie).
+    // Le chemin n'est chargé qu'à la PREMIÈRE ouverture : il interroge le
+    // cluster, et le payer à chaque rendu de la section serait gratuit.
+    if (sectionId === 'network' && !createMode) {
+      const tabs = sectionEl.querySelectorAll('[data-net-tab]');
+      let pathLoaded = false;
+      tabs.forEach(btn => btn.addEventListener('click', () => {
+        const want = btn.dataset.netTab;
+        tabs.forEach(b => b.classList.toggle('active', b === btn));
+        sectionEl.querySelectorAll('[data-net-pane]').forEach(pane => {
+          pane.hidden = pane.dataset.netPane !== want;
+        });
+        if (want === 'path' && !pathLoaded) {
+          pathLoaded = true;
+          loadNetPath(sectionEl, cluster, namespace, name);
+        }
+      }));
+    }
+
+    // v1.62.0 : ajouter / retirer une entrée des labels et annotations
+    if (sectionId === 'general') {
+      sectionEl.addEventListener('click', (e) => {
+        const add = e.target.closest('[data-kv-add]');
+        if (add) {
+          const kind = add.dataset.kvAdd;
+          sectionEl.querySelector(`[data-kv-block="${kind}"] .vm-kv-rows`).insertAdjacentHTML('beforeend', kvRowHtml(kind));
+          return;
+        }
+        const del = e.target.closest('[data-kv-del]');
+        if (del) del.closest('.vm-kv-row').remove();
+      });
+    }
+
+    if (sectionId === 'cloudinit') {
+      if (!createMode) {
+        loadCloudInit(sectionEl, cluster, namespace, name);
+        sectionEl.querySelector('[data-action="apply-cloudinit"]')?.addEventListener('click', () =>
+          applyCloudInit(sectionEl, cluster, namespace, name));
+        sectionEl.querySelector('[data-action="reload-cloudinit"]')?.addEventListener('click', () =>
+          loadCloudInit(sectionEl, cluster, namespace, name));
+      }
+
+      // v1.8.1 — assistant wiring: two generator forms feeding the editors.
+      // Container divs (the user form spans several section renders, so
+      // there are multiple .tf-form roots inside — wire/read on the parent).
+      const userForm = sectionEl.querySelector('.vm-edit-ci-userform');
+      const netForm = sectionEl.querySelector('.vm-edit-ci-netform');
+      TFForm.wire(userForm, CI_USER_SCHEMA, cluster);
+      TFForm.wire(netForm, CI_NET_SCHEMA, cluster);
+      // Per-NIC card: address/gateway only make sense in static mode.
+      const syncNet = () => {
+        netForm.querySelectorAll('.tf-block-item').forEach(item => {
+          const mode = item.querySelector('[name$=".mode"]')?.value || 'dhcp';
+          ['address', 'gateway'].forEach(f => {
+            const el = item.querySelector(`[name$=".${f}"]`);
+            const wrap = el && el.closest('.tf-field');
+            if (wrap) wrap.style.display = mode === 'static' ? '' : 'none';
+          });
+        });
+      };
+      syncNet();
+      netForm.addEventListener('change', syncNet);
+      const nicList = netForm.querySelector('.tf-block-list');
+      if (nicList) new MutationObserver(syncNet).observe(nicList, { childList: true });
+
+      const generate = (kind) => {
+        const isUser = kind === 'user';
+        const target = sectionEl.querySelector(`[data-ci="${isUser ? 'userData' : 'networkData'}"]`);
+        const result = sectionEl.querySelector(`.apply-result[data-section="ci-${isUser ? 'user' : 'net'}"]`);
+        try {
+          const spec = TFForm.read(isUser ? userForm : netForm,
+                                   isUser ? CI_USER_SCHEMA : CI_NET_SCHEMA,
+                                   { emitEmptyLists: true });
+          const yaml = isUser ? genUserData(spec) : genNetworkData(spec);
+          if (target.value.trim()
+              && !confirm(tr('vm.edit.ci.confirmReplace',
+                'Replace the current editor content with the generated YAML?'))) return;
+          target.value = yaml;
+          result.innerHTML = `<span style="color:var(--accent)">${Icons.svg('ok', { size: 14 })} ${esc(tr('vm.edit.ci.generated', 'generated — review below, then Save'))}</span>`;
+        } catch (e) {
+          result.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(e.message)}</span>`;
+        }
+      };
+      sectionEl.querySelector('[data-action="gen-userdata"]').addEventListener('click', () => generate('user'));
+      sectionEl.querySelector('[data-action="gen-netdata"]').addEventListener('click', () => generate('net'));
+      return;
+    }
+
+    // v1.12.0 : l'onglet General embarque l'éditeur de tags (cartes TFForm)
+    if (sectionId === 'general') {
+      const tagsEditor = sectionEl.querySelector('.vm-edit-cards .tf-form');
+      if (tagsEditor) TFForm.wire(tagsEditor, TAG_SCHEMA, cluster);
+    }
+
+    if (sectionId === 'placement') {
+      const selEditor = sectionEl.querySelector('[data-cards="nodesel"] .tf-form');
+      const affEditor = sectionEl.querySelector('[data-cards="affinity"] .tf-form');
+      const tolEditor = sectionEl.querySelector('[data-cards="tolerations"] .tf-form');
+      if (selEditor) TFForm.wire(selEditor, NODESEL_SCHEMA, cluster);
+      if (affEditor) TFForm.wire(affEditor, AFFINITY_SCHEMA, cluster);
+      if (tolEditor) TFForm.wire(tolEditor, TOLERATION_SCHEMA, cluster);
+    }
+
+    if (sectionId === 'firmware') {
+      const devEditor = sectionEl.querySelector('[data-cards="hostdev"] .tf-form');
+      if (devEditor) TFForm.wire(devEditor, HOSTDEV_SCHEMA, cluster);
+    }
+
+    if (sectionId === 'disks' || sectionId === 'network') {
+      const editor = sectionEl.querySelector('.vm-edit-cards .tf-form');
+      const schema = sectionId === 'disks' ? DISK_SCHEMA : NET_SCHEMA;
+      TFForm.wire(editor, schema, cluster);
+      const sync = sectionId === 'disks' ? syncDiskSourceFields : syncNicTypeFields;
+      sync(editor);
+      editor.addEventListener('change', () => sync(editor));
+      // New cards appear via +Add after this wire() — keep them in sync too.
+      new MutationObserver(() => sync(editor)).observe(
+        editor.querySelector('.tf-block-list'), { childList: true });
+
+      if (sectionId === 'disks') {
+        const refresh = () => {
+          suggestSizeFromImage(editor);
+          renderDiskCapacity(editor);
+        };
+        editor.addEventListener('change', refresh);
+        editor.addEventListener('input', () => renderDiskCapacity(editor));
+        new MutationObserver(refresh).observe(
+          editor.querySelector('.tf-block-list'), { childList: true });
+        // Les données arrivent en asynchrone : réafficher quand elles sont là.
+        setTimeout(refresh, 600);
+        setTimeout(refresh, 1800);
+      }
+    }
+
+    const applyBtn = sectionEl.querySelector('[data-action="apply"]');
+    if (applyBtn) {
+      applyBtn.addEventListener('click', async () => {
+        // En création, le bouton d'application d'une section n'a pas de
+        // VM à patcher : c'est le bouton « Créer » du panneau qui vaut
+        // validation, une fois toutes les sections assemblées.
+        if (createMode) return;
+        const dryRun = !!sectionEl.querySelector('[data-dry-run]')?.checked;
+        const result = sectionEl.querySelector('.apply-result');
+        result.textContent = 'applying…';
+        try {
+          const patch = buildPatch(sectionEl, sectionId, getVM());
+          const res = await fetch(`/api/vm/${enc(cluster)}/${enc(namespace)}/${enc(name)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ patch, dry_run: dryRun }),
+          });
+          const d = await res.json();
+          if (!res.ok) {
+            result.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc((d.detail || d.error || 'failed').slice(0, 300))}</span>`;
+            return;
+          }
+          result.innerHTML = dryRun
+            ? `<span style="color:var(--accent)">${Icons.svg('ok', { size: 14 })} ${esc(tr('vm.edit.dryOk', 'dry-run OK'))}</span>`
+            : `<span style="color:var(--accent)">${Icons.svg('ok', { size: 14 })} ${esc(tr('vm.edit.applied', 'applied'))}</span>`;
+          if (!dryRun) {
+            const refresh = refreshers.get(`vm-edit-${cluster}-${namespace}-${name}`);
+            if (refresh) setTimeout(refresh, 600);
+          }
+        } catch (e) {
+          result.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(e.message)}</span>`;
+        }
+      });
+    }
+    const resetBtn = sectionEl.querySelector('[data-action="reset"]');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        const refresh = refreshers.get(`vm-edit-${cluster}-${namespace}-${name}`);
+        if (refresh) refresh();
+      });
+    }
+  }
+
+  function buildPatch(sectionEl, sectionId, vm) {
+    const get = (selector) => sectionEl.querySelector(selector);
+    const val = (field) => {
+      const el = get(`[data-field="${field}"]`);
+      return el ? (el.type === 'number' ? Number(el.value) : el.value) : undefined;
+    };
+    switch (sectionId) {
+      case 'general': {
+        // v1.12.0 : un merge patch FUSIONNE les labels — pour retirer un
+        // tag il faut explicitement le mettre à null, sinon il survit.
+        const editor = get('.vm-edit-cards .tf-form');
+        const labels = {};
+        if (editor) {
+          const rows = (TFForm.read(editor, TAG_SCHEMA, { emitEmptyLists: true }).tag) || [];
+          const kept = new Set();
+          rows.forEach(t => {
+            const k = (t.key || '').trim();
+            if (!k) return;
+            if (!/^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(k)) {
+              throw new Error(tr('vm.edit.errTagKey', 'invalid tag key') + `: "${k}"`);
+            }
+            if (kept.has(k)) {
+              throw new Error(tr('vm.edit.errTagDup', 'duplicate tag key') + `: ${k}`);
+            }
+            kept.add(k);
+            labels[TAG_PREFIX + k] = String(t.value ?? '');
+          });
+          vmTagsToForm(vm).forEach(prev => {
+            if (!kept.has(prev.key)) labels[TAG_PREFIX + prev.key] = null;
+          });
+        }
+        const vmLabels = {
+          ...kvRead(sectionEl, vm, 'labels'),
+          'harvesterhci.io/os': val('label.os') || null,
+          // comme Harvester : écrit seulement quand ce n'est pas Migrate
+          'harvesterhci.io/maintain-mode-strategy': (val('label.maintain') || 'Migrate') === 'Migrate' ? null : val('label.maintain'),
+        };
+        return {
+          metadata: {
+            annotations: {
+              ...kvRead(sectionEl, vm, 'annots'),
+              'field.cattle.io/description': val('annot.description') || null,
+              'harvesterhci.io/description': null,
+              'harvesterhci.io/vmDisplayName': (val('annot.displayName') || '').trim() || null,
+            },
+            labels: vmLabels,
+          },
+          spec: {
+            runStrategy: val('spec.runStrategy'),
+            template: {
+              metadata: { labels: { ...kvRead(sectionEl, vm, 'ilabels'), ...labels } },
+              spec: { hostname: (val('spec.hostname') || '').trim() || null },
+            },
+          },
+        };
+      }
+      case 'compute': {
+        const cpu = {
+          sockets: val('cpu.sockets'),
+          cores:   val('cpu.cores'),
+          threads: val('cpu.threads'),
+        };
+        // Champs optionnels : vide = ne pas imposer (null retire la clé).
+        const maxSockets = val('cpu.maxSockets');
+        cpu.maxSockets = maxSockets > 0 ? maxSockets : null;
+        cpu.model = (val('cpu.model') || '').trim() || null;
+        // v1.16.0 : pinning — cases décochées = clés retirées (null), pour
+        // ne pas imposer un choix implicite à une VM ordinaire.
+        const dedicated = get('[data-field="cpu.dedicated"]')?.checked;
+        cpu.dedicatedCpuPlacement = dedicated ? true : null;
+        cpu.isolateEmulatorThread = get('[data-field="cpu.isolate"]')?.checked ? true : null;
+        cpu.numa = get('[data-field="cpu.numa"]')?.checked
+          ? { guestMappingPassthrough: {} } : null;
+        const memory = { guest: val('memory.guest') };
+        memory.maxGuest = (val('memory.maxGuest') || '').trim() || null;
+        const pick = (f) => (val(f) || '').trim() || null;
+        const resources = {};
+        const limits = { cpu: pick('res.limits.cpu'), memory: pick('res.limits.memory') };
+        const requests = { cpu: pick('res.requests.cpu'), memory: pick('res.requests.memory') };
+        if (limits.cpu || limits.memory) resources.limits = limits;
+        if (requests.cpu || requests.memory) resources.requests = requests;
+        // v1.61.0 : « Enable CPU and memory hotplug » de Harvester : un cœur
+        // et un thread par socket, maximums = sockets et mémoire x4 (réglage
+        // max-hotplug-ratio par défaut) s'ils sont vides, limites = maximums
+        const hot = !!get('[data-field="cpu.hotplugOn"]')?.checked;
+        const annotations = {
+          'harvesterhci.io/enableCPUAndMemoryHotplug': hot ? 'true' : null,
+          'harvesterhci.io/reservedMemory': (val('annot.reservedMemory') || '').trim() || null,
+        };
+        if (hot) {
+          // vu sur harvlab : KubeVirt refuse le branchement à chaud de la
+          // mémoire sous 1 Gio (« Memory hotplug is only available for VMs
+          // with at least 1Gi of guest memory »)
+          const g = /^([0-9]+)(Mi|Gi)$/.exec(String(memory.guest || ''));
+          if (g && (g[2] === 'Mi' ? Number(g[1]) < 1024 : Number(g[1]) < 1)) {
+            throw new Error(tr('vm.edit.errHotplugMem', 'memory hotplug needs at least 1Gi of guest memory'));
+          }
+          cpu.cores = 1;
+          cpu.threads = 1;
+          if (!cpu.maxSockets) cpu.maxSockets = (cpu.sockets || 1) * 4;
+          const m = /^([0-9]+)(Mi|Gi)$/.exec(String(memory.guest || ''));
+          if (!memory.maxGuest && m) memory.maxGuest = `${Number(m[1]) * 4}${m[2]}`;
+          resources.limits = { ...(resources.limits || {}), cpu: String(cpu.maxSockets), memory: memory.maxGuest || (resources.limits || {}).memory };
+        }
+        const domain = { cpu, memory };
+        if (Object.keys(resources).length) domain.resources = resources;
+        return { metadata: { annotations }, spec: { template: { spec: { domain } } } };
+      }
+      case 'firmware': {
+        const mode = val('fw.mode') || 'bios';
+        const tpmOn = !!get('[data-field="fw.tpm"]')?.checked;
+        const tpmPersist = !!get('[data-field="fw.tpmPersistent"]')?.checked;
+        const machine = (val('fw.machine') || '').trim();
+        const serial = (val('fw.serial') || '').trim();
+        const firmware = {};
+        if (mode === 'bios') {
+          firmware.bootloader = null;          // retire l'EFI -> BIOS hérité
+        } else {
+          firmware.bootloader = { efi: { secureBoot: mode === 'uefi-sb' } };
+        }
+        if (serial) firmware.serial = serial;
+        const domain = {
+          firmware,
+          // Secure Boot EXIGE la fonctionnalité SMM côté KubeVirt ; sans
+          // elle l'apiserver refuse la VM. On la retire en sortant du
+          // Secure Boot pour ne pas laisser de résidu.
+          features: { smm: mode === 'uefi-sb' ? { enabled: true } : null },
+          devices: { tpm: tpmOn ? (tpmPersist ? { persistent: true } : {}) : null },
+        };
+        if (machine) domain.machine = { type: machine };
+        // v1.15.0 : autoattach* — KubeVirt les considère à true quand la
+        // clé est absente. On n'écrit donc `false` que pour désactiver, et
+        // on RETIRE la clé (null) pour revenir au défaut.
+        const off = (f) => get(`[data-field="${f}"]`)?.checked === false ? false : null;
+        domain.devices.autoattachSerialConsole = off('dev.serialConsole');
+        domain.devices.autoattachGraphicsDevice = off('dev.graphics');
+        domain.devices.autoattachMemBalloon = off('dev.balloon');
+        domain.devices.inputs = get('[data-field="dev.tablet"]')?.checked
+          ? [{ name: 'tablet', type: 'tablet', bus: 'usb' }] : null;
+        const wd = val('dev.watchdog');
+        domain.devices.watchdog = wd
+          ? { name: 'watchdog', i6300esb: { action: wd } } : null;
+        const devEditor = sectionEl.querySelector('[data-cards="hostdev"] .tf-form');
+        const rows = ((devEditor ? TFForm.read(devEditor, HOSTDEV_SCHEMA, { emitEmptyLists: true }).dev : []) || [])
+          .filter(d => (d.name || '').trim() && (d.device_name || '').trim());
+        // Un périphérique USB porte le nom de son USBDevice, comme dans
+        // Harvester : c'est par ce nom qu'il sait qu'une VM s'en sert.
+        const host = rows.filter(d => d.kind !== 'gpu')
+          .map(d => {
+            const dn = d.device_name.trim();
+            const usb = dn.startsWith('kubevirt.io/') ? dn.slice('kubevirt.io/'.length) : '';
+            return { name: usb || d.name.trim(), deviceName: dn };
+          });
+        const gpus = rows.filter(d => d.kind === 'gpu')
+          .map(d => ({ name: d.name.trim(), deviceName: d.device_name.trim() }));
+        domain.devices.hostDevices = host.length ? host : null;
+        domain.devices.gpus = gpus.length ? gpus : null;
+        return { spec: { template: { spec: { domain } } } };
+      }
+      case 'placement': {
+        const selEditor = sectionEl.querySelector('[data-cards="nodesel"] .tf-form');
+        const affEditor = sectionEl.querySelector('[data-cards="affinity"] .tf-form');
+        const prev = vmPlacementToForm(vm);
+        // nodeSelector : map -> une clé retirée doit partir à null.
+        const nodeSelector = {};
+        const kept = new Set();
+        ((selEditor ? TFForm.read(selEditor, NODESEL_SCHEMA, { emitEmptyLists: true }).sel : []) || [])
+          .forEach(r => {
+            const k = (r.key || '').trim();
+            if (!k) return;
+            kept.add(k);
+            nodeSelector[k] = String(r.value ?? '');
+          });
+        prev.sel.forEach(p => { if (!kept.has(p.key)) nodeSelector[p.key] = null; });
+        const rules = ((affEditor ? TFForm.read(affEditor, AFFINITY_SCHEMA, { emitEmptyLists: true }).rule : []) || [])
+          .filter(r => (r.key || '').trim() && String(r.value ?? '').trim());
+        const affinity = formPlacementToAffinity(rules);
+        const tolEditor = sectionEl.querySelector('[data-cards="tolerations"] .tf-form');
+        const tolRows = ((tolEditor ? TFForm.read(tolEditor, TOLERATION_SCHEMA, { emitEmptyLists: true }).tol : []) || [])
+          .filter(t => (t.key || '').trim() || t.operator === 'Exists')
+          .map(t => {
+            const out = { operator: t.operator || 'Equal' };
+            if ((t.key || '').trim()) out.key = t.key.trim();
+            if (out.operator === 'Equal' && (t.value || '').trim()) out.value = t.value.trim();
+            if (t.effect) out.effect = t.effect;
+            return out;
+          });
+        return { spec: { template: { spec: {
+          nodeSelector, affinity,
+          tolerations: tolRows.length ? tolRows : null,
+        } } } };
+      }
+      case 'lifecycle':
+        return {
+          spec: { template: { spec: {
+            terminationGracePeriodSeconds: val('lifecycle.terminationGracePeriodSeconds'),
+            evictionStrategy: val('lifecycle.evictionStrategy') || null,
+          } } },
+        };
+      case 'disks': {
+        const adv = get('.vm-edit-adv');
+        if (adv && adv.open) {
+          const obj = fromYaml(get('[data-yaml="disks"]').value);
+          return { spec: { template: { spec: {
+            volumes: obj.volumes || [],
+            domain: { devices: { disks: obj.disks || [] } },
+          } } } };
+        }
+        const editor = get('.vm-edit-cards .tf-form');
+        const read = TFForm.read(editor, DISK_SCHEMA, { emitEmptyLists: true });
+        const { passthrough } = vmDisksToForm(vm);
+        return formDisksToPatch(read.disk || [], passthrough, vm);
+      }
+      case 'network': {
+        const adv = get('.vm-edit-adv');
+        if (adv && adv.open) {
+          const obj = fromYaml(get('[data-yaml="network"]').value);
+          return { spec: { template: { spec: {
+            networks: obj.networks || [],
+            domain: { devices: { interfaces: obj.interfaces || [] } },
+          } } } };
+        }
+        const editor = get('.vm-edit-cards .tf-form');
+        const read = TFForm.read(editor, NET_SCHEMA, { emitEmptyLists: true });
+        const { passthrough } = vmNetsToForm(vm);
+        const patch = formNetsToPatch(read.nic || [], passthrough, vm);
+        // v1.62.0 : les IP statiques, annotations de la VM (null = retirée)
+        const annotations = {};
+        Object.keys((vm.metadata || {}).annotations || {})
+          .filter(k => k.startsWith('static-ip.harvesterhci.io/')).forEach(k => { annotations[k] = null; });
+        (read.nic || []).forEach(n => {
+          const ip = (n.static_ip || '').trim();
+          if (ip && n.type === 'bridge') annotations[`static-ip.harvesterhci.io/${n.name}`] = ip;
+        });
+        if (Object.keys(annotations).length) patch.metadata = { ...(patch.metadata || {}), annotations };
+        return patch;
+      }
+      default:
+        return {};
+    }
+  }
+
+  async function loadCloudInit(sectionEl, cluster, namespace, name) {
+    const out = sectionEl.querySelector('#ci-source');
+    out.textContent = 'loading…';
+    try {
+      const d = await fetch(`/api/vm/${enc(cluster)}/${enc(namespace)}/${enc(name)}/cloudinit`).then(r => r.json());
+      sectionEl.querySelector('[data-ci="userData"]').value    = d.userData || '';
+      sectionEl.querySelector('[data-ci="networkData"]').value = d.networkData || '';
+      out.innerHTML = d.source === 'secret'
+        ? `source: Secret <code>${esc(d.secretName)}</code>`
+        : d.source === 'inline'
+          ? `<span style="color:var(--warn)">${esc(tr('vm.edit.ci.inline', 'inline cloud-init: saving moves it into a Secret'))}</span>`
+          : `<span style="color:var(--text-dim)">${esc(tr('vm.edit.ci.none', 'no cloud-init yet: saving creates one (read at the next boot)'))}</span>`;
+    } catch (e) {
+      out.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(e.message)}</span>`;
+    }
+  }
+
+  async function applyCloudInit(sectionEl, cluster, namespace, name) {
+    const result = sectionEl.querySelector('.apply-result[data-section="cloudinit"]') || sectionEl.querySelector('.apply-result');
+    result.textContent = tr('vm.create.sending', 'Sending…');
+    const body = {
+      userData:    sectionEl.querySelector('[data-ci="userData"]').value,
+      networkData: sectionEl.querySelector('[data-ci="networkData"]').value,
+      guestAgent:  !!sectionEl.querySelector('[data-ci-agent]')?.checked,
+      // v1.16.0 : noms des KeyPairs choisies dans l'assistant. Le YAML
+      // porte le matériel de clé ; Harvester, lui, affiche les clés
+      // d'une VM d'après l'annotation sshNames — on la synchronise.
+      // Le libellé d'une ref namespacée est « nom (namespace) » : Harvester
+      // n'attend que le nom de la KeyPair.
+      sshNames: [...sectionEl.querySelectorAll('[name$=".ssh_key"]')]
+        .map(sel => sel.value && sel.selectedOptions && sel.selectedOptions[0]
+             ? sel.selectedOptions[0].textContent.trim().replace(/\s*\([^()]*\)\s*$/, '') : '')
+        .filter(Boolean),
+    };
+    try {
+      // v1.60.0 : une action suivie (dock, Activité), qui crée et branche un
+      // Secret quand la VM n'a pas encore de cloud-init
+      const res = await fetch(`/api/vm/${enc(cluster)}/${enc(namespace)}/${enc(name)}/cloudinit`,
+        { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const d = await res.json();
+      if (!res.ok) {
+        result.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(d.error || res.status)}</span>`;
+        return;
+      }
+      if (window.Dock && Dock.poll) Dock.poll();
+      result.textContent = tr('bk.started', 'Started').replace('{id}', d.action_id);
+      if (!window.SSEReconnect) return;
+      let last = '';
+      const es = SSEReconnect.connect(`/api/stream/${enc(d.action_id)}`, {
+        on: {
+          step: (e) => { try { const s = JSON.parse(e.data); if (s.message) { last = s.message; result.textContent = s.message; } } catch { /* ligne illisible */ } },
+          end: (e) => {
+            let x = {};
+            try { x = JSON.parse(e.data); } catch { /* fin sans détail */ }
+            es.close();
+            result.innerHTML = x.status === 'done'
+              ? `<span style="color:var(--accent)">${Icons.svg('ok', { size: 14 })} ${esc(last || 'saved')}</span>`
+              : `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(last || x.error_summary || x.status || '?')}</span>`;
+            if (x.status === 'done') loadCloudInit(sectionEl, cluster, namespace, name);
+          },
+        },
+      });
+    } catch (e) {
+      result.innerHTML = `<span style="color:var(--danger)">${Icons.svg('fail', { size: 14 })} ${esc(e.message)}</span>`;
+    }
+  }
+
+  // The "YAML" editors are actually pretty-printed JSON (we don't bundle
+  // js-yaml); the advanced fold keeps that historical contract.
+  function toYaml(obj) {
+    return JSON.stringify(obj, null, 2);
+  }
+  function fromYaml(text) {
+    return JSON.parse(text);
+  }
+  function enc(s) { return encodeURIComponent(s); }
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  return {
+    open,
+    // v1.28.0 : la création de VM REJOUE ces deux fonctions sur un
+    // squelette au lieu d'une VM existante. C'est ce qui garantit que tout
+    // ce qui est éditable est réglable à la création, sans dupliquer les
+    // huit sections de formulaire.
+    SECTIONS,
+    renderSectionHtml,
+    buildPatch,
+    wireSection,
+    // exported for tests (pure functions, no DOM)
+    _mappers: {
+      vmTagsToForm, vmPlacementToForm, formPlacementToAffinity, vmDisksToForm, formDisksToPatch, vmNetsToForm, formNetsToPatch,
+                genUserData, genNetworkData },
+    _schemas: { DISK_SCHEMA, NET_SCHEMA, CI_USER_SCHEMA, CI_NET_SCHEMA, TAG_SCHEMA,
+                 NODESEL_SCHEMA, AFFINITY_SCHEMA, TOLERATION_SCHEMA, HOSTDEV_SCHEMA },
+  };
+})();
+
+if (typeof window !== 'undefined') window.VMEdit = VMEdit;
+if (typeof FloatingPanels !== 'undefined') {
+  FloatingPanels.registerType('vm-edit', (args) =>
+    VMEdit.open(args.cluster, args.namespace, args.name));
+}
